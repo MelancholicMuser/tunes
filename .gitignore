@@ -1,0 +1,16 @@
+# Temporary & OS files
+.DS_Store
+*.tmp
+*.log
+*.m3u
+
+# Data files created at runtime
+data/
+downloads/
+history.tsv
+favorites.tsv
+feeds.tsv
+podcast_history.tsv
+
+# Sockets
+*.sock

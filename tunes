@@ -1,0 +1,625 @@
+#!/usr/bin/env bash
+# tunes.sh — search, play, queue, and manage music from the terminal
+# Deps: mpv, yt-dlp, fzf, python3, curl  |  optional: playerctl (media keys), sptlrx (lyrics), Ollama (recommend/mood)
+
+set -euo pipefail
+
+DATA_DIR="$HOME/.local/share/tunes"
+HISTORY_FILE="$DATA_DIR/history.tsv"
+FAVORITES_FILE="$DATA_DIR/favorites.tsv"
+DOWNLOAD_DIR="$HOME/Music/tunes-downloads"
+MPV_SOCKET="/tmp/tunes-mpv.sock"
+
+FEEDS_FILE="$DATA_DIR/feeds.tsv"                 # name\turl
+POD_HISTORY_FILE="$DATA_DIR/podcast_history.tsv"  # title\turl\tfeed_name
+
+OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
+OLLAMA_MODEL="${OLLAMA_MODEL:-llama3.2:3b}"
+
+mkdir -p "$DATA_DIR" "$DOWNLOAD_DIR"
+touch "$HISTORY_FILE" "$FAVORITES_FILE" "$FEEDS_FILE" "$POD_HISTORY_FILE"
+
+# ---------- helpers ----------
+
+need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing dependency: $1"; exit 1; }; }
+need mpv
+need yt-dlp
+need fzf
+need python3
+need curl
+
+# Checks Ollama is reachable; prints a helpful message once if not.
+ollama_available() {
+  curl -s --max-time 2 "${OLLAMA_URL}/api/tags" >/dev/null 2>&1
+}
+
+# Sends a prompt to the local model, returns raw text response on stdout.
+# Usage: llm_ask "system instructions" "user content"
+llm_ask() {
+  local system="$1" user="$2"
+  if ! ollama_available; then
+    echo "⚠ Ollama not reachable at ${OLLAMA_URL} (is it running?)" >&2
+    return 1
+  fi
+  python3 - "$OLLAMA_URL" "$OLLAMA_MODEL" "$system" "$user" <<'PYEOF'
+import sys, json, urllib.request
+url, model, system, user = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+payload = {
+    "model": model,
+    "prompt": user,
+    "system": system,
+    "stream": False,
+    "options": {"temperature": 0.7}
+}
+req = urllib.request.Request(
+    url.rstrip('/') + "/api/generate",
+    data=json.dumps(payload).encode(),
+    headers={"Content-Type": "application/json"}
+)
+try:
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read().decode())
+        print(data.get("response", "").strip())
+except Exception as e:
+    print(f"__LLM_ERROR__ {e}", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+}
+
+YTDL_ARGS="--ytdl-format=bestaudio/best --ytdl-raw-options=extractor-args=youtube:player_client=android"
+
+# Strip common YouTube title clutter so lyrics tools (sptlrx) can match artist/title.
+# Removes: (Official Video), [Lyrics], (Audio), ft./feat., HD/HQ tags, extra brackets, etc.
+clean_title() {
+  local t="$1"
+  t=$(sed -E '
+    s/[\(\[][^)\]]*(official|video|audio|lyrics?|hd|hq|4k|visualizer|remastered|mv|m\/v)[^)\]]*[\)\]]//Ig;
+    s/\s*[-–]\s*(Topic)\s*$//I;
+    s/\bft\.?\s+/feat. /Ig;
+    s/\s{2,}/ /g;
+    s/^\s+|\s+$//g;
+    s/\s*[-–]\s*$//
+  ' <<< "$t")
+  echo "$t"
+}
+
+log_history() {
+  local title="$1" url="$2"
+  # dedupe: remove existing entry, then prepend
+  grep -v -F "$url" "$HISTORY_FILE" > "$HISTORY_FILE.tmp" 2>/dev/null || true
+  { echo -e "${title}\t${url}"; cat "$HISTORY_FILE.tmp" 2>/dev/null; } > "$HISTORY_FILE"
+  rm -f "$HISTORY_FILE.tmp"
+  # keep last 200
+  head -n 200 "$HISTORY_FILE" > "$HISTORY_FILE.tmp" && mv "$HISTORY_FILE.tmp" "$HISTORY_FILE"
+}
+
+play_url() {
+  local title="$1" url="$2" clean loop_flag=""
+  clean=$(clean_title "$title")
+  log_history "$title" "$url"
+  [[ "${LOOP:-0}" == "1" ]] && loop_flag="--loop-file=inf"
+  echo "▶ Playing: $clean$( [[ -n "$loop_flag" ]] && echo ' (looping)' )"
+  mpv --no-video --input-ipc-server="$MPV_SOCKET" \
+      $YTDL_ARGS \
+      --force-media-title="$clean" \
+      $loop_flag \
+      --term-osd-bar \
+      "$url"
+}
+
+search_and_pick() {
+  local query="$1" count="${2:-15}"
+  echo "Searching: $query ..."
+  yt-dlp "ytsearch${count}:${query}" --flat-playlist -j 2>/dev/null \
+    | jq -r '"\(.title)\t\(.url // ("https://www.youtube.com/watch?v=" + .id))"'
+}
+
+pick_from_list() {
+  # reads tab-separated title\turl from stdin, returns selected line
+  fzf --delimiter='\t' --with-nth=1 --prompt="🎵 > " --height=60% --border --reverse
+}
+
+# ---------- word-frequency helper (used by recommend) ----------
+# Reads titles (one per line) on stdin, prints top-N meaningful words on stdout.
+top_words() {
+  local n="${1:-3}"
+  tr '[:upper:]' '[:lower:]' \
+    | tr -c 'a-z0-9' '\n' \
+    | grep -vE '^(the|and|feat|ft|official|video|audio|lyrics|remix|mv|hd|hq|with|for|from|of|to|in|on|a|an|is|by|ep|vol|part|full|album|song|music|podcast|episode)$' \
+    | awk 'length($0)>2' \
+    | sort | uniq -c | sort -rn \
+    | head -n "$n" | awk '{print $2}'
+}
+
+# Cleans up numbered/bulleted/quoted LLM output into plain lines, capped at N.
+llm_lines_to_list() {
+  local n="${1:-5}"
+  sed -E 's/^[[:space:]]*[-*0-9.)]+[[:space:]]*//' \
+    | sed -E 's/^"(.*)"$/\1/' \
+    | grep -v '^\s*$' \
+    | head -n "$n"
+}
+
+# ---------- podcast helpers (RSS via python3, no extra deps) ----------
+
+# Parses an RSS feed URL, prints title\tenclosure_url\tpubdate per episode (newest first)
+# Never propagates a non-zero exit — a bad/slow feed should degrade to "no episodes", not kill the script.
+pod_parse_feed() {
+  local url="$1" limit="${2:-30}"
+  curl -sL --max-time 15 "$url" 2>/dev/null | python3 <(cat <<'PYEOF'
+import sys, xml.etree.ElementTree as ET
+limit = int(sys.argv[1])
+data = sys.stdin.buffer.read()
+try:
+    root = ET.fromstring(data)
+except Exception:
+    sys.exit(0)
+items = root.findall('.//item')[:limit]
+for it in items:
+    title_el = it.find('title')
+    title = (title_el.text or '').strip().replace('\t', ' ') if title_el is not None else 'Untitled'
+    enc = it.find('enclosure')
+    link = enc.get('url') if enc is not None and enc.get('url') else None
+    if not link:
+        link_el = it.find('link')
+        link = link_el.text.strip() if link_el is not None and link_el.text else None
+    pub_el = it.find('pubDate')
+    pub = (pub_el.text or '').strip() if pub_el is not None else ''
+    if link:
+        print(f"{title}\t{link}\t{pub}")
+PYEOF
+) "$limit" 2>/dev/null || true
+  return 0
+}
+
+# iTunes Search API lookup (free, no key) -> name\tfeed_url
+pod_itunes_search() {
+  local query="$1" limit="${2:-10}"
+  curl -sL --max-time 15 "https://itunes.apple.com/search?media=podcast&limit=${limit}&term=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$query")" 2>/dev/null \
+    | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for r in data.get('results', []):
+    name = (r.get('collectionName') or 'Unknown').replace('\t',' ')
+    feed = r.get('feedUrl')
+    if feed:
+        print(f'{name}\t{feed}')
+" 2>/dev/null || true
+  return 0
+}
+
+# ---------- commands ----------
+
+cmd_search() {
+  local query="${1:-}"
+  [[ -z "$query" ]] && read -rp "Search: " query
+  local selection
+  selection=$(search_and_pick "$query" | pick_from_list) || { echo "Cancelled."; exit 0; }
+  [[ -z "$selection" ]] && exit 0
+  local title url
+  title=$(cut -f1 <<<"$selection")
+  url=$(cut -f2 <<<"$selection")
+  play_url "$title" "$url"
+}
+
+cmd_queue() {
+  # multi-select search -> builds an mpv playlist
+  local query="${1:-}"
+  [[ -z "$query" ]] && read -rp "Search (queue mode): " query
+  local selections
+  selections=$(search_and_pick "$query" | fzf --multi --delimiter='\t' --with-nth=1 \
+      --prompt="🎵 select multiple (tab) > " --height=60% --border --reverse) || exit 0
+  [[ -z "$selections" ]] && exit 0
+  local playlist_file; playlist_file=$(mktemp /tmp/tunes-queue-XXXX.m3u)
+  local count=0
+  while IFS=$'\t' read -r title url; do
+    local clean; clean=$(clean_title "$title")
+    log_history "$title" "$url"
+    { echo "#EXTINF:-1,${clean}"; echo "$url"; } >> "$playlist_file"
+    count=$((count+1))
+  done <<< "$selections"
+  echo "▶ Playing queue of ${count} tracks"
+  local loop_flag=""
+  [[ "${LOOP:-0}" == "1" ]] && loop_flag="--loop-playlist=inf"
+  mpv --no-video --input-ipc-server="$MPV_SOCKET" $YTDL_ARGS $loop_flag --term-osd-bar "$playlist_file"
+  rm -f "$playlist_file"
+}
+
+cmd_video() {
+  local query="${1:-}"
+  [[ -z "$query" ]] && read -rp "Search (video): " query
+  local selection
+  selection=$(search_and_pick "$query" | pick_from_list) || { echo "Cancelled."; exit 0; }
+  [[ -z "$selection" ]] && exit 0
+  local title url clean
+  title=$(cut -f1 <<<"$selection")
+  url=$(cut -f2 <<<"$selection")
+  clean=$(clean_title "$title")
+  log_history "$title" "$url"
+  local loop_flag=""
+  [[ "${LOOP:-0}" == "1" ]] && loop_flag="--loop-file=inf"
+  echo "▶ Playing (video): $clean"
+  mpv --input-ipc-server="$MPV_SOCKET" \
+      $YTDL_ARGS \
+      --force-media-title="$clean" \
+      $loop_flag \
+      "$url"
+}
+
+cmd_vlc() {
+  local query="${1:-}"
+  [[ -z "$query" ]] && read -rp "Search (VLC): " query
+  local selection
+  selection=$(search_and_pick "$query" | pick_from_list) || { echo "Cancelled."; exit 0; }
+  [[ -z "$selection" ]] && exit 0
+  local title url clean resolved
+  title=$(cut -f1 <<<"$selection")
+  url=$(cut -f2 <<<"$selection")
+  clean=$(clean_title "$title")
+  log_history "$title" "$url"
+  echo "Resolving stream URL..."
+  resolved=$(yt-dlp -f "bestaudio/best" --extractor-args "youtube:player_client=android" -g "$url" | head -1)
+  [[ -z "$resolved" ]] && { echo "Failed to resolve stream."; exit 1; }
+  local loop_flag=""
+  [[ "${LOOP:-0}" == "1" ]] && loop_flag="--loop=-1"
+  echo "▶ Opening in VLC: $clean"
+  vlc --meta-title="$clean" $loop_flag "$resolved" >/dev/null 2>&1 &
+  disown
+}
+
+
+cmd_history() {
+  [[ ! -s "$HISTORY_FILE" ]] && { echo "No history yet."; exit 0; }
+  local selection
+  selection=$(pick_from_list < "$HISTORY_FILE") || exit 0
+  [[ -z "$selection" ]] && exit 0
+  play_url "$(cut -f1 <<<"$selection")" "$(cut -f2 <<<"$selection")"
+}
+
+cmd_favorite_add() {
+  [[ ! -s "$HISTORY_FILE" ]] && { echo "Nothing in history to favorite yet."; exit 0; }
+  local selection
+  selection=$(pick_from_list < "$HISTORY_FILE") || exit 0
+  [[ -z "$selection" ]] && exit 0
+  grep -v -F "$(cut -f2 <<<"$selection")" "$FAVORITES_FILE" > "$FAVORITES_FILE.tmp" 2>/dev/null || true
+  { echo "$selection"; cat "$FAVORITES_FILE.tmp" 2>/dev/null; } > "$FAVORITES_FILE"
+  rm -f "$FAVORITES_FILE.tmp"
+  echo "★ Added to favorites."
+}
+
+cmd_favorites() {
+  [[ ! -s "$FAVORITES_FILE" ]] && { echo "No favorites yet. Use: tunes fav-add"; exit 0; }
+  local selection
+  selection=$(pick_from_list < "$FAVORITES_FILE") || exit 0
+  [[ -z "$selection" ]] && exit 0
+  play_url "$(cut -f1 <<<"$selection")" "$(cut -f2 <<<"$selection")"
+}
+
+cmd_download() {
+  local query="${1:-}"
+  [[ -z "$query" ]] && read -rp "Search to download: " query
+  local selection
+  selection=$(search_and_pick "$query" | pick_from_list) || exit 0
+  [[ -z "$selection" ]] && exit 0
+  local url; url=$(cut -f2 <<<"$selection")
+  echo "⬇ Downloading as mp3 to $DOWNLOAD_DIR ..."
+  yt-dlp -x --audio-format mp3 --audio-quality 0 \
+    -o "${DOWNLOAD_DIR}/%(title)s.%(ext)s" "$url"
+}
+
+cmd_lyrics() {
+  if command -v sptlrx >/dev/null 2>&1; then
+    sptlrx
+  else
+    echo "sptlrx not installed. It's a Go binary, not a pip package."
+    echo "Install with: curl -sSL https://raw.githubusercontent.com/raitonoberu/sptlrx/main/install.sh | bash"
+  fi
+}
+
+# playerctl-based transport controls (works while mpv is running with --input-ipc-server)
+cmd_ctl() {
+  local action="${1:-}"
+  case "$action" in
+    pause|play-pause) echo '{ "command": ["cycle", "pause"] }' | socat - "$MPV_SOCKET" 2>/dev/null || playerctl play-pause ;;
+    next)  echo '{ "command": ["playlist-next"] }' | socat - "$MPV_SOCKET" 2>/dev/null || playerctl next ;;
+    prev)  echo '{ "command": ["playlist-prev"] }' | socat - "$MPV_SOCKET" 2>/dev/null || playerctl previous ;;
+    vol-up)   echo '{ "command": ["add", "volume", 5] }' | socat - "$MPV_SOCKET" 2>/dev/null ;;
+    vol-down) echo '{ "command": ["add", "volume", -5] }' | socat - "$MPV_SOCKET" 2>/dev/null ;;
+    loop-on)  echo '{ "command": ["set_property", "loop-file", "inf"] }' | socat - "$MPV_SOCKET" 2>/dev/null && echo "🔁 Loop ON" ;;
+    loop-off) echo '{ "command": ["set_property", "loop-file", "no"] }' | socat - "$MPV_SOCKET" 2>/dev/null && echo "Loop OFF" ;;
+    loop-toggle)
+      # cycle loop-file between "no" and "inf"
+      echo '{ "command": ["cycle-values", "loop-file", "inf", "no"] }' | socat - "$MPV_SOCKET" 2>/dev/null && echo "🔁 Loop toggled" ;;
+    *) echo "Usage: tunes ctl {pause|next|prev|vol-up|vol-down|loop-on|loop-off|loop-toggle}"; exit 1 ;;
+  esac
+}
+
+play_podcast_url() {
+  local title="$1" url="$2" feed_name="${3:-}" loop_flag=""
+  grep -v -F "$url" "$POD_HISTORY_FILE" > "$POD_HISTORY_FILE.tmp" 2>/dev/null || true
+  { echo -e "${title}\t${url}\t${feed_name}"; cat "$POD_HISTORY_FILE.tmp" 2>/dev/null; } > "$POD_HISTORY_FILE"
+  rm -f "$POD_HISTORY_FILE.tmp"
+  head -n 300 "$POD_HISTORY_FILE" > "$POD_HISTORY_FILE.tmp" && mv "$POD_HISTORY_FILE.tmp" "$POD_HISTORY_FILE"
+  [[ "${LOOP:-0}" == "1" ]] && loop_flag="--loop-file=inf"
+  echo "🎙 Playing: $title"
+  mpv --no-video --input-ipc-server="$MPV_SOCKET" \
+      --force-media-title="$title" \
+      $loop_flag --term-osd-bar \
+      "$url"
+}
+
+cmd_podcast_add() {
+  local query="${1:-}"
+  [[ -z "$query" ]] && read -rp "Podcast name to search: " query
+  echo "Searching iTunes directory: $query ..."
+  local results
+  results=$(pod_itunes_search "$query" 10) || true
+  [[ -z "$results" ]] && { echo "No podcasts found."; exit 0; }
+  local selection
+  selection=$(echo "$results" | fzf --delimiter='\t' --with-nth=1 --prompt="🎙 subscribe > " --height=60% --border --reverse) || exit 0
+  [[ -z "$selection" ]] && exit 0
+  local name url
+  name=$(cut -f1 <<<"$selection")
+  url=$(cut -f2 <<<"$selection")
+  grep -v -F "$url" "$FEEDS_FILE" > "$FEEDS_FILE.tmp" 2>/dev/null || true
+  { cat "$FEEDS_FILE.tmp" 2>/dev/null; echo -e "${name}\t${url}"; } > "$FEEDS_FILE"
+  rm -f "$FEEDS_FILE.tmp"
+  echo "✔ Subscribed to: $name"
+}
+
+cmd_podcast_feeds() {
+  [[ ! -s "$FEEDS_FILE" ]] && { echo "No subscriptions yet. Use: tunes pod-add \"<name>\""; exit 0; }
+  column -t -s $'\t' "$FEEDS_FILE"
+}
+
+cmd_podcast_play() {
+  [[ ! -s "$FEEDS_FILE" ]] && { echo "No subscriptions yet. Use: tunes pod-add \"<name>\""; exit 0; }
+  local feed_selection feed_name feed_url
+  feed_selection=$(pick_from_list < "$FEEDS_FILE") || exit 0
+  [[ -z "$feed_selection" ]] && exit 0
+  feed_name=$(cut -f1 <<<"$feed_selection")
+  feed_url=$(cut -f2 <<<"$feed_selection")
+  echo "Fetching episodes for: $feed_name ..."
+  local episodes
+  episodes=$(pod_parse_feed "$feed_url" 40) || true
+  [[ -z "$episodes" ]] && { echo "No episodes found (feed may be unreachable)."; exit 0; }
+  local ep_selection
+  ep_selection=$(echo "$episodes" | fzf --delimiter='\t' --with-nth=1 --prompt="🎙 $feed_name > " --height=60% --border --reverse) || exit 0
+  [[ -z "$ep_selection" ]] && exit 0
+  play_podcast_url "$(cut -f1 <<<"$ep_selection")" "$(cut -f2 <<<"$ep_selection")" "$feed_name"
+}
+
+cmd_podcast_history() {
+  [[ ! -s "$POD_HISTORY_FILE" ]] && { echo "No podcast history yet."; exit 0; }
+  local selection
+  selection=$(pick_from_list < "$POD_HISTORY_FILE") || exit 0
+  [[ -z "$selection" ]] && exit 0
+  play_podcast_url "$(cut -f1 <<<"$selection")" "$(cut -f2 <<<"$selection")" "$(cut -f3 <<<"$selection" 2>/dev/null || true)"
+}
+
+# ---------- recommendations ----------
+# Simple, local, no API key: mine your own history for frequent keywords,
+# then either (a) search yt-dlp for music matches you haven't played, or
+# (b) surface unplayed episodes from your subscribed podcast feeds.
+
+cmd_recommend_music() {
+  [[ ! -s "$HISTORY_FILE" ]] && { echo "No listening history yet — play some tracks first."; exit 0; }
+  local keywords played
+  played=$(cut -f2 "$HISTORY_FILE")
+
+  if ollama_available; then
+    echo "Asking Llama 3.2 to read your listening history..."
+    local recent; recent=$(cut -f1 "$HISTORY_FILE" | head -n 30)
+    local sys="You are a music recommendation assistant. Given a list of recently played track titles, infer the listener's taste (genre, mood, era, artists) and suggest 5 short YouTube search queries for NEW tracks they'd likely enjoy — similar vein, but not the same songs. Reply with ONLY the 5 queries, one per line, no numbering, no explanation."
+    local raw; raw=$(llm_ask "$sys" "$recent" 2>/dev/null) || raw=""
+    keywords=$(echo "$raw" | llm_lines_to_list 5)
+  fi
+
+  if [[ -z "${keywords:-}" ]]; then
+    echo "Falling back to keyword analysis of your history..."
+    keywords=$(cut -f1 "$HISTORY_FILE" | top_words 3)
+  fi
+  [[ -z "$keywords" ]] && { echo "Not enough history to build recommendations yet."; exit 0; }
+
+  echo "Based on:"
+  echo "$keywords" | sed 's/^/  • /'
+  local combined=""
+  while IFS= read -r kw; do
+    [[ -z "$kw" ]] && continue
+    combined+="$(search_and_pick "$kw" 6 || true)"$'\n'
+  done <<< "$keywords"
+
+  local filtered
+  filtered=$(echo "$combined" | grep -v '^\s*$' | awk -F'\t' '!seen[$2]++')
+  if [[ -n "$played" ]]; then
+    filtered=$(echo "$filtered" | grep -vFf <(echo "$played") || true)
+  fi
+  [[ -z "$filtered" ]] && { echo "Couldn't find fresh recommendations right now."; exit 0; }
+  local selection
+  selection=$(echo "$filtered" | pick_from_list) || exit 0
+  [[ -z "$selection" ]] && exit 0
+  play_url "$(cut -f1 <<<"$selection")" "$(cut -f2 <<<"$selection")"
+}
+
+cmd_recommend_podcast() {
+  [[ ! -s "$FEEDS_FILE" ]] && { echo "No subscriptions yet. Use: tunes pod-add \"<name>\" first."; exit 0; }
+  echo "Checking your subscriptions for unplayed episodes..."
+  local played all_new=""
+  played=$(cut -f2 "$POD_HISTORY_FILE" 2>/dev/null || true)
+  while IFS=$'\t' read -r name url; do
+    [[ -z "$url" ]] && continue
+    local eps; eps=$(pod_parse_feed "$url" 10) || true
+    while IFS=$'\t' read -r etitle eurl epub; do
+      [[ -z "$eurl" ]] && continue
+      grep -qF "$eurl" <<<"$played" && continue
+      all_new+="${etitle} — ${name}"$'\t'"${eurl}"$'\t'"${epub}"$'\n'
+    done <<< "$eps"
+  done < "$FEEDS_FILE"
+  all_new=$(echo "$all_new" | grep -v '^\s*$')
+  [[ -z "$all_new" ]] && { echo "You're all caught up — no new episodes."; exit 0; }
+
+  if ollama_available; then
+    echo "Asking Llama 3.2 to rank unplayed episodes..."
+    local titles_only; titles_only=$(echo "$all_new" | cut -f1)
+    local sys="You are a podcast curator. Given a numbered list of unplayed episode titles, pick the 8 most interesting or substantive ones (skip filler/ad/trailer-sounding titles). Reply with ONLY the exact titles you picked, one per line, copied verbatim from the input, no numbering, no commentary."
+    local numbered; numbered=$(nl -ba -w1 -s'. ' <<< "$titles_only")
+    local raw; raw=$(llm_ask "$sys" "$numbered" 2>/dev/null) || raw=""
+    if [[ -n "$raw" ]]; then
+      local ranked=""
+      while IFS= read -r line; do
+        line=$(sed -E 's/^[[:space:]]*[-*0-9.)]+[[:space:]]*//' <<<"$line")
+        [[ -z "$line" ]] && continue
+        local match; match=$(echo "$all_new" | grep -F "$line" | head -n1)
+        [[ -n "$match" ]] && ranked+="$match"$'\n'
+      done <<< "$raw"
+      [[ -n "$ranked" ]] && all_new="$ranked"
+    fi
+  fi
+
+  local selection
+  selection=$(echo "$all_new" | fzf --delimiter='\t' --with-nth=1 --prompt="🎙 recommended > " --height=60% --border --reverse) || exit 0
+  [[ -z "$selection" ]] && exit 0
+  local full_title; full_title=$(cut -f1 <<<"$selection")
+  play_podcast_url "${full_title%% — *}" "$(cut -f2 <<<"$selection")" "${full_title##* — }"
+}
+
+cmd_recommend() {
+  case "${1:-}" in
+    podcast|pod) cmd_recommend_podcast ;;
+    music|"")    cmd_recommend_music ;;
+    *) echo "Usage: tunes recommend {music|podcast}"; exit 1 ;;
+  esac
+}
+
+# ---------- natural language / mood search (Llama 3.2:3b via Ollama) ----------
+
+cmd_mood() {
+  local desc="${1:-}"
+  [[ -z "$desc" ]] && read -rp "Describe what you want to listen to: " desc
+  [[ -z "$desc" ]] && exit 0
+
+  if ! ollama_available; then
+    echo "⚠ Ollama not reachable at ${OLLAMA_URL}. Falling back to plain search on: $desc"
+    cmd_search "$desc"
+    return
+  fi
+
+  echo "Thinking about: \"$desc\" ..."
+  local sys="You turn a mood or vibe description into good YouTube search queries for music. Reply with ONLY 5 short search queries, one per line, no numbering, no explanation, no quotes."
+  local raw; raw=$(llm_ask "$sys" "$desc" 2>/dev/null) || raw=""
+  local queries; queries=$(echo "$raw" | llm_lines_to_list 5)
+  if [[ -z "$queries" ]]; then
+    echo "Model gave no usable output, falling back to plain search."
+    cmd_search "$desc"
+    return
+  fi
+
+  echo "Searching for:"
+  echo "$queries" | sed 's/^/  • /'
+  local combined=""
+  while IFS= read -r q; do
+    [[ -z "$q" ]] && continue
+    combined+="$(search_and_pick "$q" 6 || true)"$'\n'
+  done <<< "$queries"
+  combined=$(echo "$combined" | grep -v '^\s*$' | awk -F'\t' '!seen[$2]++')
+  [[ -z "$combined" ]] && { echo "No results found."; exit 0; }
+
+  local selections
+  selections=$(echo "$combined" | fzf --multi --delimiter='\t' --with-nth=1 \
+      --prompt="🎵 mood: $desc (tab to multi-select) > " --height=60% --border --reverse) || exit 0
+  [[ -z "$selections" ]] && exit 0
+
+  local playlist_file; playlist_file=$(mktemp /tmp/tunes-mood-XXXX.m3u)
+  local count=0
+  while IFS=$'\t' read -r title url; do
+    local clean; clean=$(clean_title "$title")
+    log_history "$title" "$url"
+    { echo "#EXTINF:-1,${clean}"; echo "$url"; } >> "$playlist_file"
+    count=$((count+1))
+  done <<< "$selections"
+  echo "▶ Playing mood queue of ${count} tracks"
+  local loop_flag=""
+  [[ "${LOOP:-0}" == "1" ]] && loop_flag="--loop-playlist=inf"
+  mpv --no-video --input-ipc-server="$MPV_SOCKET" $YTDL_ARGS $loop_flag --term-osd-bar "$playlist_file"
+  rm -f "$playlist_file"
+}
+
+cmd_help() {
+  cat <<EOF
+tunes — free terminal music player (yt-dlp + mpv + fzf)
+
+Usage:
+  tunes search [query]      Search and play one track
+  tunes video  [query]      Search and play with video
+  tunes vlc    [query]      Search and open in VLC
+  tunes queue  [query]      Search, multi-select, play as queue
+  tunes history              Browse & replay recent tracks
+  tunes fav-add              Save a track from history to favorites
+  tunes favorites             Browse & play favorites
+  tunes download [query]      Download a track as mp3 (offline listening)
+  tunes lyrics                Live lyrics via sptlrx (if installed)
+  tunes ctl {pause|next|prev|vol-up|vol-down|loop-on|loop-off|loop-toggle}
+                               Control running playback
+
+  --- Podcasts ---
+  tunes pod-add [name]        Search iTunes directory & subscribe to a feed
+  tunes pod-feeds             List your subscriptions
+  tunes pod                   Pick a feed, then an episode, and play it
+  tunes pod-history           Browse & replay recent episodes
+
+  --- Recommendations (local, no API key) ---
+  tunes recommend music       Suggest new tracks (uses Llama 3.2:3b if running, else keyword fallback)
+  tunes recommend podcast     Surface & rank unplayed episodes from your feeds
+
+  --- Natural language (needs Ollama + llama3.2:3b running locally) ---
+  tunes mood [description]    e.g. tunes mood "rainy day lofi for coding"
+                               Turns a vibe into search queries, multi-select, queue & play
+
+  tunes help                  Show this message
+
+Flags (place before the subcommand):
+  -l, --loop     Start playback with looping enabled
+                  e.g. tunes -l search blinding lights
+                       tunes --loop queue lofi beats
+
+Once playing, toggle looping anytime without restarting:
+  tunes ctl loop-toggle
+  tunes ctl loop-on / tunes ctl loop-off
+EOF
+}
+
+# ---------- dispatch ----------
+
+LOOP=0
+while [[ "${1:-}" == -* ]]; do
+  case "$1" in
+    -l|--loop) LOOP=1; shift ;;
+    -h|--help) cmd_help; exit 0 ;;
+    *) break ;;
+  esac
+done
+export LOOP
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  search)     cmd_search "${1:-}";;
+  video)      cmd_video "${1:-}";;
+  vlc)        cmd_vlc "${1:-}";;
+  queue)      cmd_queue "${1:-}";;
+  history)    cmd_history;;
+  fav-add)    cmd_favorite_add;;
+  favorites)  cmd_favorites;;
+  download)   cmd_download "${1:-}";;
+  lyrics)     cmd_lyrics;;
+  ctl)        cmd_ctl "${1:-}";;
+  pod-add)    cmd_podcast_add "${1:-}";;
+  pod-feeds)  cmd_podcast_feeds;;
+  pod)        cmd_podcast_play;;
+  pod-history) cmd_podcast_history;;
+  recommend)  cmd_recommend "${1:-}";;
+  mood)       cmd_mood "${1:-}";;
+  help|-h|--help|*) cmd_help;;
+esac
