@@ -1,22 +1,33 @@
 # 🎵 tunes
 
-> **Search, play, queue, download, and manage music & podcasts directly from your terminal.**  
-> Powered by `mpv`, `yt-dlp`, `fzf`, and optional local AI with Ollama (`llama3.2:3b`).
+> **Search, play, queue, download, and manage music & podcasts directly from your terminal with native GNOME integration.**  
+> Powered by `mpv`, `yt-dlp`, `fzf`, `python3`, and optional local AI with Ollama (`llama3.2:3b`).
 
 ---
 
 ## ✨ Features
 
-- 🎧 **Instant Streaming**: Search and stream audio seamlessly without bloat.
-- 🔀 **Interactive Queues & Playlists**: Multi-select tracks using `fzf` and play continuous queues.
-- 🎙️ **Podcast Player & Directory**: Search the Apple iTunes podcast directory, subscribe to RSS feeds, and stream episodes.
-- 🤖 **AI-Powered Vibe & Mood Search**: Describe a vibe (e.g., *"rainy day lofi for coding"*) and let a local LLM generate tailored playlists.
-- 🧠 **Smart Recommendations**: Smart track and podcast episode recommendations based on your listening history.
-- 📥 **MP3 Downloader**: Save audio files directly to your music folder for offline listening.
-- 📜 **History & Favorites**: Effortlessly bookmark favorite tracks and revisit past listening history.
-- 🎤 **Synchronized Lyrics**: Integrated support for live terminal lyrics via `sptlrx`.
-- ⏯️ **Playback Controls**: Control volume, pause, skip, and loop mode on running streams via IPC (`socat`/`playerctl`).
-- 🎬 **Video & Alternative Player Support**: Switch between terminal audio, full video playback, or launch in `vlc`.
+- 🎧 **Instant Audio Streaming**: Search and stream YouTube audio seamlessly without bloat.
+- 🔔 **Native GNOME & Desktop Notifications**:
+  - **MPRIS2 D-Bus Controls**: Full interactive media widget in GNOME's top-bar calendar/notification drawer and on the Lock Screen.
+  - **System Media Keys**: Control playback (Play/Pause, Next, Prev, Stop) using keyboard hotkeys and Bluetooth headsets.
+  - **Actionable Notifications**: Native desktop popups on track start/change with interactive **`⏯ Play/Pause`** and **`⏭ Next`** buttons.
+  - **On-Screen Volume Feedback**: Volume changes display native GNOME volume slider notifications.
+- 🔀 **Interactive Queues & Playlists**: Multi-select tracks using `fzf` (Tab to select) and play continuous queues with optional shuffle (`-s`).
+- 📁 **Custom Named Playlists**: Create, manage, and play saved playlists (`tunes playlist`).
+- 🚀 **Background / Detached Playback**: Run playback in the background (`tunes bg [query]` or `-d`) to immediately free your terminal prompt.
+- 🎙️ **Podcast Player with Auto-Resume**:
+  - Search the Apple iTunes podcast directory or subscribe directly via RSS feed URL.
+  - Automatically remembers exact playback position so you can resume long episodes right where you left off.
+  - Download podcast episodes directly as MP3 files for offline listening.
+- 🤖 **AI-Powered Vibe & Mood Search**: Describe a vibe (e.g., *"rainy day lofi for coding"*) and let local Ollama (`llama3.2:3b`) generate tailored queues.
+- 🧠 **Smart Recommendations**: Suggest new music tracks and surface unplayed podcast episodes based on your listening history.
+- 📊 **Listening Statistics**: Track your total plays, favorite keywords, top repeated tracks, and feed subscriptions (`tunes stats`).
+- 📥 **Offline MP3 Downloader**: Download tracks with embedded metadata and cover thumbnails to `~/Music/tunes-downloads`.
+- 📜 **History & Favorites**: Bookmark favorite tracks, remove favorites, and replay recent tracks.
+- 🎤 **Synchronized Lyrics**: Live terminal lyrics support via `sptlrx`.
+- ⏯️ **Extended Transport Controls**: Seek relative time (`seek +15`), adjust speed (`speed 1.5`), set direct volume (`vol 80`), toggle mute, and stop cleanly via IPC.
+- 🎬 **Video & VLC Mode**: Stream with a full video window or launch in `vlc`.
 
 ---
 
@@ -25,25 +36,26 @@
 ### Core Requirements
 Make sure the following dependencies are installed on your system:
 
-| Dependency | Purpose | Recommended Installation (Ubuntu/Debian / Arch / macOS) |
-| :--- | :--- | :--- |
-| **`bash`** (4.0+) | Shell runtime environment | Pre-installed |
-| **`mpv`** | Core media player backend | `sudo apt install mpv` / `pacman -S mpv` / `brew install mpv` |
-| **`yt-dlp`** | Audio stream extraction | `sudo apt install yt-dlp` / `pacman -S yt-dlp` / `brew install yt-dlp` |
-| **`fzf`** | Terminal interactive picker | `sudo apt install fzf` / `pacman -S fzf` / `brew install fzf` |
-| **`python3`** | RSS & iTunes API parsing | Pre-installed / `sudo apt install python3` |
-| **`curl`** | HTTP network fetching | Pre-installed / `sudo apt install curl` |
-| **`jq`** | JSON stream formatting | `sudo apt install jq` / `pacman -S jq` / `brew install jq` |
+| Dependency | Purpose | Fedora | Ubuntu / Debian | Arch | macOS |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **`bash`** (4.0+) | Shell runtime environment | Pre-installed | Pre-installed | Pre-installed | `brew install bash` |
+| **`mpv`** | Core media player backend | `sudo dnf install mpv` | `sudo apt install mpv` | `pacman -S mpv` | `brew install mpv` |
+| **`yt-dlp`** | Audio stream extraction | `sudo dnf install yt-dlp` | `sudo apt install yt-dlp` | `pacman -S yt-dlp` | `brew install yt-dlp` |
+| **`fzf`** | Terminal interactive picker | `sudo dnf install fzf` | `sudo apt install fzf` | `pacman -S fzf` | `brew install fzf` |
+| **`python3`** | RSS & IPC communication | Pre-installed | Pre-installed | Pre-installed | `brew install python3` |
+| **`curl`** | HTTP network fetching | Pre-installed | Pre-installed | Pre-installed | `brew install curl` |
+| **`jq`** | JSON stream formatting | `sudo dnf install jq` | `sudo apt install jq` | `pacman -S jq` | `brew install jq` |
 
 ### Optional Enhancements
 
+- 🔔 **GNOME / FreeDesktop Desktop Notifications**: `libnotify` (`notify-send`) and `mpv-mpris` (for MPRIS2 desktop widgets).
 - 🤖 **[Ollama](https://ollama.com)** (with `llama3.2:3b` model): Powers `tunes mood` vibe generation and intelligent history ranking.
   ```bash
   ollama run llama3.2:3b
   ```
-- 🎛️ **`socat`** or **`playerctl`**: Enables transport controls (`pause`, `next`, `prev`, volume adjust, looping).
+- 🎛️ **`playerctl`**: Hardware media key support for desktop environments.
   ```bash
-  sudo apt install socat playerctl
+  sudo dnf install playerctl   # or: sudo apt install playerctl
   ```
 - 🎤 **`sptlrx`**: Real-time synchronized lyrics display.
   ```bash
@@ -82,70 +94,116 @@ export PATH="$HOME/.local/bin:$PATH"
 ## 📖 Usage Guide
 
 ```
-tunes — free terminal music player (yt-dlp + mpv + fzf)
+tunes — terminal music & podcast player with GNOME integration
 
 Usage:
-  tunes search [query]       Search and play a track
-  tunes queue  [query]       Search, multi-select (Tab), and play continuous queue
-  tunes video  [query]       Search and stream with video window
-  tunes vlc    [query]       Search and launch in VLC media player
-  tunes history              Browse and replay recent tracks
-  tunes fav-add              Save a recent track to favorites
-  tunes favorites            Browse and play favorite tracks
-  tunes download [query]     Download track as high-quality MP3
-  tunes lyrics               Display real-time synchronized lyrics (sptlrx)
+  tunes search [query]        Search YouTube and play one track
+  tunes bg [query]            Search and play in background (frees terminal immediately)
+  tunes play <url|path>       Play direct URL, YouTube link, or local audio file
+  tunes queue [query]         Search, multi-select (TAB), play as queue
+  tunes video [query]         Search and play with video window
+  tunes vlc [query]           Search and open stream in VLC
+  tunes history               Browse & replay recent tracks
+  tunes fav-add               Save a track from history to favorites
+  tunes favorites             Browse & play favorites
+  tunes fav-remove            Remove a track from favorites
+  tunes download [query]      Download a track as mp3 with tags & cover art
+  tunes lyrics                Live lyrics via sptlrx (if installed)
+  tunes stats                 View listening stats and top tracks
 
-Playback Controls:
-  tunes ctl {pause|next|prev|vol-up|vol-down|loop-on|loop-off|loop-toggle}
+  --- GNOME & Playback Control ---
+  tunes status / tunes np     Show current track, elapsed time, volume, and state
+  tunes notify                Show desktop notification of current track
+  tunes ctl {action} [args]   Control playback:
+      pause                   Toggle play / pause
+      play                    Resume playback
+      stop                    Stop playback and close mpv
+      next / prev             Skip to next / previous track in queue
+      vol-up / vol-down       Increase / decrease volume (shows GNOME slider)
+      vol <0-100>             Set volume level directly
+      mute                    Toggle mute
+      seek <+/-sec>           Seek position (e.g. tunes ctl seek +15)
+      speed <rate>            Set playback speed (e.g. tunes ctl speed 1.5)
+      loop-toggle             Toggle track looping
+      loop-on / loop-off      Turn looping on or off
 
-Podcasts:
-  tunes pod-add [name]       Search iTunes podcast directory & subscribe
-  tunes pod-feeds            List subscribed podcast feeds
-  tunes pod                  Browse episodes from subscribed podcasts & play
-  tunes pod-history          Browse podcast listening history
+  --- Playlists ---
+  tunes playlist list         List your saved playlists
+  tunes playlist create <name>Create a new playlist
+  tunes playlist add <name>   Add a track from search or history
+  tunes playlist play <name>  Play a saved playlist
+  tunes playlist view <name>  View tracks in a playlist
+  tunes playlist delete <name>Delete a playlist
 
-AI & Recommendations:
-  tunes mood [description]   AI-generated queue based on vibe (e.g. "late night ambient synth")
-  tunes recommend music      Recommend new music tracks based on listening history
-  tunes recommend podcast    Surface & rank unplayed podcast episodes
+  --- Podcasts ---
+  tunes pod                   Pick a subscribed feed, then an episode, and play
+  tunes pod-add [name]        Search iTunes directory & subscribe to feed
+  tunes pod-add-url <url>     Subscribe directly via RSS feed URL
+  tunes pod-feeds             List your podcast subscriptions
+  tunes pod-history           Browse & replay recent episodes (auto-resumes position!)
+  tunes pod-download          Download podcast episode for offline listening
+  tunes pod-remove            Unsubscribe from a feed
 
-Global Flags:
-  -l, --loop                 Start playback with looping enabled
-                             (e.g., tunes -l search "blinding lights")
+  --- AI & Smart Recommendations ---
+  tunes recommend music       Suggest new tracks based on your listening history
+  tunes recommend podcast     Surface & rank unplayed episodes from your feeds
+  tunes mood [vibe]           Describe what you want to hear (e.g. "rainy lofi")
+                              Uses Ollama + Llama 3.2 to craft search & build queue
+
+Flags (place before the subcommand):
+  -d, --bg, --detach          Run playback in background, return terminal immediately
+  -l, --loop                  Start playback with looping enabled
+  -s, --shuffle               Shuffle playlist or queue tracks randomly
+  -h, --help                  Show this help message
 ```
 
-### Key Workflows & Examples
+---
 
-#### 1. Quick Search & Stream
+## 💡 Workflows & Examples
+
+### 1. GNOME Desktop Integration
+When playing music or podcasts, `tunes` automatically:
+- Registers on D-Bus via MPRIS2: interactive controls appear in GNOME's top-bar calendar menu and Lock Screen.
+- Hardware keyboard media keys (Play/Pause, Next, Prev) work system-wide.
+- Displays interactive desktop notifications with clickable `⏯ Play/Pause` and `⏭ Next` buttons.
+
+### 2. Background Playback
+Play music in the background without tying up your shell:
 ```bash
-tunes search "daft punk one more time"
+tunes bg "synthwave chill"
+tunes status          # Check playback progress anytime
+tunes ctl vol-up      # Increase volume with on-screen slider
+tunes ctl pause       # Pause playback
 ```
 
-#### 2. Queue Multiple Songs
+### 3. Custom Named Playlists
 ```bash
-tunes queue "lofi hip hop"
-```
-*Use `Tab` to select multiple tracks in `fzf`, then press `Enter` to start the playlist.*
-
-#### 3. AI Vibe Search
-```bash
-tunes mood "relaxing jazz for a rainy evening"
+tunes playlist create "Study Beats"
+tunes playlist add "Study Beats" "chopin nocturne"
+tunes -s playlist play "Study Beats"   # Play in shuffled order
 ```
 
-#### 4. Play Podcasts
+### 4. Direct Playback
 ```bash
-# Search & Subscribe
-tunes pod-add "syntax fm"
+tunes play "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+tunes play ~/Music/song.mp3
+```
 
-# Play Episodes
+### 5. Podcast Subscriptions & Resuming
+```bash
+# Subscribe via iTunes directory or direct RSS
+tunes pod-add "lex fridman"
+tunes pod-add-url "https://feeds.simplecast.com/kwWc0lhf" "Hidden Brain"
+
+# Play episode (automatically resumes where you left off)
 tunes pod
 ```
 
-#### 5. Download MP3 for Offline Listening
+### 6. Shell Tab-Completion
+Add this line to your `~/.bashrc` to enable full tab-completion:
 ```bash
-tunes download "synthwave mix 2024"
+eval "$(tunes completion)"
 ```
-*Files are saved to `~/Music/tunes-downloads`.*
 
 ---
 
@@ -157,8 +215,10 @@ tunes download "synthwave mix 2024"
   - `favorites.tsv` — Saved favorite tracks
   - `feeds.tsv` — RSS podcast feed subscriptions
   - `podcast_history.tsv` — Podcast listening history
+  - `playlists/` — Saved custom playlists
+  - `scripts/` — mpv Lua notification and MPRIS integration scripts
 - **Download directory**: `~/Music/tunes-downloads/`
-- **Socket file**: `/tmp/tunes-mpv.sock` (used for playback IPC controls)
+- **IPC Socket**: `$XDG_RUNTIME_DIR/tunes-mpv-<UID>.sock`
 
 ---
 
