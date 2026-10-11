@@ -1,43 +1,121 @@
 #!/usr/bin/env bash
-# tunes — search, play, queue, and manage music & podcasts from the terminal
-# Features: GNOME Notification & MPRIS2 controls, background playback, playlists, Ollama AI recs, and offline downloads.
-# Deps: mpv, yt-dlp, fzf, python3, curl, jq  |  optional: playerctl (media keys), sptlrx (lyrics), Ollama (recommend/mood)
+# tunes — a lightweight terminal music & podcast player
+#   Stream (yt-dlp + mpv), queue, playlists, favorites, podcasts, per-song play
+#   counts, listening reports, and optional local-LLM insights
+#   (Ollama or any OpenAI-compatible server such as llama.cpp / LM Studio).
+# Deps: mpv, yt-dlp, fzf, python3, curl, jq   (stats / report / config / help only need python3)
+# Optional: playerctl, sptlrx, notify-send, a local LLM server
 
 set -euo pipefail
 
-DATA_DIR="$HOME/.local/share/tunes"
+TUNES_VERSION="2.0.0"
+
+# ---------- paths ----------
+
+DATA_DIR="${TUNES_DATA_DIR:-$HOME/.local/share/tunes}"
 PLAYLISTS_DIR="$DATA_DIR/playlists"
 SCRIPTS_DIR="$DATA_DIR/scripts"
-HISTORY_FILE="$DATA_DIR/history.tsv"
-FAVORITES_FILE="$DATA_DIR/favorites.tsv"
-DOWNLOAD_DIR="$HOME/Music/tunes-downloads"
-POD_DOWNLOAD_DIR="$DOWNLOAD_DIR/Podcasts"
-FEEDS_FILE="$DATA_DIR/feeds.tsv"                 # name\turl
+REPORTS_DIR="$DATA_DIR/reports"
+HISTORY_FILE="$DATA_DIR/history.tsv"          # title\turl            (recent, de-duplicated)
+FAVORITES_FILE="$DATA_DIR/favorites.tsv"      # title\turl
+FEEDS_FILE="$DATA_DIR/feeds.tsv"              # name\turl
 POD_HISTORY_FILE="$DATA_DIR/podcast_history.tsv"  # title\turl\tfeed_name
+PLAYS_FILE="$DATA_DIR/plays.tsv"              # epoch\tkind\tlistened\tduration\ttitle\tartist\turl
+QUEUE_FILE="$DATA_DIR/current-queue.m3u"
+LOG_FILE="$DATA_DIR/tunes.log"
+LAST_REPORT_FILE="$DATA_DIR/.last_report"
+DOWNLOAD_DIR="${TUNES_DOWNLOAD_DIR:-$HOME/Music/tunes-downloads}"
+POD_DOWNLOAD_DIR="$DOWNLOAD_DIR/Podcasts"
 
 RUNTIME_BASE="${XDG_RUNTIME_DIR:-/tmp}"
 MPV_SOCKET="${RUNTIME_BASE}/tunes-mpv-${UID:-$(id -u)}.sock"
 
-OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
-OLLAMA_MODEL="${OLLAMA_MODEL:-llama3.2:3b}"
+# ---------- configuration ----------
+# Settings live in a plain KEY=VALUE file (never executed). Real environment
+# variables always override it. Manage with:  tunes config
 
-mkdir -p "$DATA_DIR" "$PLAYLISTS_DIR" "$SCRIPTS_DIR" "$DOWNLOAD_DIR" "$POD_DOWNLOAD_DIR"
-touch "$HISTORY_FILE" "$FAVORITES_FILE" "$FEEDS_FILE" "$POD_HISTORY_FILE"
+CONFIG_FILE="${TUNES_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/tunes/config}"
+CONFIG_KEYS=(LLM_BACKEND LLM_URL LLM_MODEL LLM_API_KEY LLM_TIMEOUT YT_CLIENT PLAY_THRESHOLD REPORT_REMINDER DEFAULT_VOLUME)
 
-# ---------- helpers & dependency verification ----------
-
-need() {
-  command -v "$1" >/dev/null 2>&1 || { echo "Missing dependency: $1" >&2; exit 1; }
+is_config_key() {
+  local k
+  for k in "${CONFIG_KEYS[@]}"; do [[ "$k" == "$1" ]] && return 0; done
+  return 1
 }
-need mpv
-need yt-dlp
-need fzf
-need python3
-need curl
-need jq
+
+ENV_OVERRIDES=()
+load_config() {
+  [[ -f "$CONFIG_FILE" ]] || return 0
+  local line key val
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ "$line" =~ ^[[:space:]]*([A-Z_]+)=(.*)$ ]] || continue
+    key="${BASH_REMATCH[1]}"; val="${BASH_REMATCH[2]}"
+    is_config_key "$key" || continue
+    if [[ -n "${!key+x}" ]]; then ENV_OVERRIDES+=("$key"); continue; fi   # environment wins over the file
+    val="${val%\"}"; val="${val#\"}"; val="${val%\'}"; val="${val#\'}"
+    printf -v "$key" '%s' "$val"
+  done < "$CONFIG_FILE"
+}
+load_config
+
+case "${LLM_BACKEND:-ollama}" in
+  openai|llamacpp|llama.cpp|lmstudio|vllm|oai) LLM_BACKEND=openai ;;
+  *) LLM_BACKEND=ollama ;;
+esac
+if [[ -z "${LLM_URL:-}" ]]; then
+  if [[ -n "${OLLAMA_URL:-}" ]]; then LLM_URL="$OLLAMA_URL"            # legacy variable
+  elif [[ "$LLM_BACKEND" == openai ]]; then LLM_URL="http://localhost:8080"
+  else LLM_URL="http://localhost:11434"; fi
+fi
+LLM_MODEL="${LLM_MODEL:-${OLLAMA_MODEL:-llama3.2:3b}}"           # OLLAMA_MODEL = legacy variable
+LLM_API_KEY="${LLM_API_KEY:-}"
+LLM_TIMEOUT="${LLM_TIMEOUT:-120}"
+YT_CLIENT="${YT_CLIENT-android}"        # set empty to stop forcing a YouTube client
+PLAY_THRESHOLD="${PLAY_THRESHOLD:-30}"  # seconds of listening that count as one "play"
+REPORT_REMINDER="${REPORT_REMINDER:-on}"
+DEFAULT_VOLUME="${DEFAULT_VOLUME:-}"
+
+# ---------- small helpers ----------
+
+require() {
+  local missing=() d
+  for d in "$@"; do command -v "$d" >/dev/null 2>&1 || missing+=("$d"); done
+  if ((${#missing[@]})); then
+    echo "Missing dependency: ${missing[*]}" >&2
+    echo "Run 'tunes doctor' for install hints." >&2
+    exit 1
+  fi
+}
+
+# Create state files lazily (only commands that need them call this).
+init_state() {
+  mkdir -p "$DATA_DIR" "$PLAYLISTS_DIR" "$SCRIPTS_DIR"
+  touch "$HISTORY_FILE" "$FAVORITES_FILE" "$FEEDS_FILE" "$POD_HISTORY_FILE" "$PLAYS_FILE"
+}
+
+# TSV fields must not contain tabs/newlines.
+sanitize_field() {
+  local s="$1"
+  s="${s//$'\t'/ }"; s="${s//$'\n'/ }"; s="${s//$'\r'/ }"
+  printf '%s' "$s"
+}
+
+# Playlist names become file names: keep them safe.
+sanitize_name() {
+  local s; s=$(sanitize_field "$1")
+  s="${s//\//-}"; s="${s//\\/-}"
+  s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"
+  while [[ "$s" == .* ]]; do s="${s#.}"; done
+  printf '%s' "$s"
+}
+
+# ---------- GNOME / desktop integration ----------
 
 # Ensure GNOME desktop file and MPRIS/notify scripts are installed
-ensure_gnome_integration() {
+ensure_integration() {
+  [[ -n "${_TUNES_INTEGRATED:-}" ]] && return 0
+  _TUNES_INTEGRATED=1
   local apps_dir="$HOME/.local/share/applications"
   local desktop_file="$apps_dir/tunes.desktop"
   if [[ ! -f "$desktop_file" ]]; then
@@ -47,7 +125,7 @@ ensure_gnome_integration() {
 Name=Tunes
 GenericName=Terminal Music Player
 Comment=Terminal music and podcast player with GNOME controls
-Exec=tunes search
+Exec=tunes
 Icon=audio-headphones
 Terminal=true
 Type=Application
@@ -126,48 +204,220 @@ EOF
     mkdir -p "$mpv_scripts_dir"
     cp "$SCRIPTS_DIR/mpris.so" "$mpv_scripts_dir/mpris.so" 2>/dev/null || true
   fi
+  return 0
 }
-ensure_gnome_integration
 
-# Robust IPC sender using Python AF_UNIX socket
-# Usage: mpv_ipc '["command", "arg"]' [wait_response: 0|1]
-mpv_ipc() {
-  local cmd_json="$1" wait_resp="${2:-0}"
-  if [[ ! -S "$MPV_SOCKET" ]]; then
-    return 1
-  fi
-  python3 - "$MPV_SOCKET" "$cmd_json" "$wait_resp" <<'PYEOF'
+# Writes the play-tracking mpv script (re-written whenever its version stamp is missing).
+ensure_tracker() {
+  local f="$SCRIPTS_DIR/tunes-track.lua"
+  grep -q 'tunes-lua v1' "$f" 2>/dev/null && return 0
+  mkdir -p "$SCRIPTS_DIR"
+  cat > "$f" <<'LUAEOF'
+-- tunes-lua v1: play tracker. Appends one line per listening session to the
+-- plays log: epoch \t kind \t seconds_listened \t duration \t title \t artist \t url
+local mp = require 'mp'
+
+local plays_file = os.getenv("TUNES_PLAYS_FILE")
+if not plays_file or plays_file == "" then return end
+local kind = os.getenv("TUNES_KIND") or "music"
+
+local MIN_LOG = 3      -- ignore sessions shorter than this many seconds
+local cur = nil        -- state of the track currently being listened to
+
+local function clean(s)
+    return (tostring(s or ""):gsub("[%c]+", " "))
+end
+
+local function artist_from(meta)
+    if type(meta) ~= "table" then return "" end
+    local lower = {}
+    for k, v in pairs(meta) do lower[tostring(k):lower()] = v end
+    return lower["artist"] or lower["uploader"] or lower["channel"]
+        or lower["album_artist"] or ""
+end
+
+local function start_track()
+    cur = {
+        url = mp.get_property("path") or "",
+        title = mp.get_property("media-title") or "",
+        artist = artist_from(mp.get_property_native("metadata")),
+        duration = mp.get_property_number("duration") or 0,
+        listened = 0,
+        last_pos = nil,
+        started = os.time(),
+    }
+end
+
+local function flush()
+    if not cur then return end
+    local c = cur
+    cur = nil
+    if c.url == "" or c.listened < MIN_LOG then return end
+    local f = io.open(plays_file, "a")
+    if not f then return end
+    f:write(string.format("%d\t%s\t%.1f\t%.1f\t%s\t%s\t%s\n",
+        c.started, clean(kind), c.listened, c.duration,
+        clean(c.title), clean(c.artist), clean(c.url)))
+    f:close()
+end
+
+-- Keep metadata fresh: streams often fill these in after file-loaded.
+mp.observe_property("media-title", "string", function(_, v)
+    if cur and v and v ~= "" then cur.title = v end
+end)
+mp.observe_property("duration", "number", function(_, v)
+    if cur and v and v > 0 then cur.duration = v end
+end)
+mp.observe_property("metadata", "native", function(_, v)
+    if cur then
+        local a = artist_from(v)
+        if a ~= "" then cur.artist = a end
+    end
+end)
+
+-- Accumulate *actually played* media seconds: small forward steps only, so
+-- seeks don't inflate the total and pauses add nothing.
+mp.observe_property("time-pos", "number", function(_, pos)
+    if not cur or not pos then return end
+    local last = cur.last_pos
+    if last then
+        local d = pos - last
+        if d > 0 and d < 5 then
+            cur.listened = cur.listened + d
+        elseif d < -5 and last > 0 and cur.duration > 0
+               and last >= cur.duration - 5 and pos < 5 then
+            -- natural loop-around (--loop-file): close this play, begin the next
+            flush()
+            start_track()
+        end
+    end
+    if cur then cur.last_pos = pos end
+end)
+
+mp.register_event("file-loaded", function() flush(); start_track() end)
+mp.register_event("end-file", flush)
+mp.register_event("shutdown", flush)
+LUAEOF
+}
+
+# ---------- mpv IPC ----------
+# mpv_ipc '<json command array>' [mode]
+#   mode 0: fire & check (default)   1: print the scalar result   2: print JSON result
+# Replies are matched by request_id, so asynchronous mpv events can't be mistaken for them.
+IPC_PY=''
+read -r -d '' IPC_PY <<'PYEOF' || true
 import sys, socket, json
-
-sock_path = sys.argv[1]
+path, raw, mode = sys.argv[1], sys.argv[2], sys.argv[3]
 try:
-    cmd = json.loads(sys.argv[2])
+    cmd = json.loads(raw)
 except Exception:
     sys.exit(1)
-
-wait_resp = sys.argv[3] == "1"
-
 try:
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.settimeout(1.0)
-    s.connect(sock_path)
-    s.sendall(json.dumps({"command": cmd}).encode('utf-8') + b"\n")
-    s.shutdown(socket.SHUT_WR)
-    resp = s.recv(4096)
-    s.close()
-    if wait_resp and resp:
-        data = json.loads(resp.decode('utf-8', errors='ignore'))
-        val = data.get("data")
-        if val is not None:
-            if isinstance(val, bool):
-                print("true" if val else "false")
-            else:
-                print(val)
-    sys.exit(0)
+    s.settimeout(1.5)
+    s.connect(path)
+    s.sendall((json.dumps({"command": cmd, "request_id": 4242}) + "\n").encode())
+    buf = b""
+    while True:
+        chunk = s.recv(65536)
+        if not chunk:
+            sys.exit(1)
+        buf += chunk
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            try:
+                msg = json.loads(line)
+            except Exception:
+                continue
+            if msg.get("request_id") != 4242:
+                continue
+            if msg.get("error") != "success":
+                sys.exit(1)
+            data = msg.get("data")
+            if mode == "1" and data is not None:
+                print("true" if data is True else "false" if data is False else data)
+            elif mode == "2":
+                print(json.dumps(data))
+            sys.exit(0)
 except Exception:
     sys.exit(1)
 PYEOF
+
+mpv_ipc() {
+  local cmd_json="$1" mode="${2:-0}"
+  [[ -S "$MPV_SOCKET" ]] || return 1
+  python3 -c "$IPC_PY" "$MPV_SOCKET" "$cmd_json" "$mode"
 }
+
+# ---------- local LLM (Ollama or any OpenAI-compatible server) ----------
+
+llm_base() { local b="${LLM_URL%/}"; printf '%s' "${b%/v1}"; }
+
+llm_available() {
+  local base; base=$(llm_base)
+  local args=(-sf --max-time 3)
+  [[ -n "$LLM_API_KEY" ]] && args+=(-H "Authorization: Bearer $LLM_API_KEY")
+  if [[ "$LLM_BACKEND" == openai ]]; then
+    curl "${args[@]}" "$base/v1/models" >/dev/null 2>&1
+  else
+    curl "${args[@]}" "$base/api/tags" >/dev/null 2>&1
+  fi
+}
+
+LLM_PY=''
+read -r -d '' LLM_PY <<'PYEOF' || true
+import sys, os, json, re, urllib.request, urllib.error
+backend, base, model, timeout = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4])
+system = os.environ.get("TUNES_LLM_SYSTEM", "")
+user = sys.stdin.read()
+headers = {"Content-Type": "application/json"}
+if os.environ.get("LLM_API_KEY"):
+    headers["Authorization"] = "Bearer " + os.environ["LLM_API_KEY"]
+if backend == "openai":
+    url = base + "/v1/chat/completions"
+    payload = {"model": model, "temperature": 0.7, "stream": False,
+               "messages": [{"role": "system", "content": system},
+                            {"role": "user", "content": user}]}
+else:
+    url = base + "/api/generate"
+    payload = {"model": model, "prompt": user, "system": system, "stream": False,
+               "options": {"temperature": 0.7}}
+req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=headers)
+try:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode())
+except urllib.error.HTTPError as e:
+    body = ""
+    try:
+        body = e.read().decode(errors="ignore")[:200]
+    except Exception:
+        pass
+    hint = f" (model '{model}' not found? try: ollama pull {model})" if e.code == 404 and backend != "openai" else ""
+    print(f"LLM request failed: HTTP {e.code} {body}{hint}", file=sys.stderr)
+    sys.exit(1)
+except Exception as e:
+    print(f"LLM request failed: {e}", file=sys.stderr)
+    sys.exit(1)
+if backend == "openai":
+    text = ((data.get("choices") or [{}])[0].get("message") or {}).get("content", "")
+else:
+    text = data.get("response", "")
+text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S).strip()
+print(text)
+PYEOF
+
+# Sends a prompt to the configured local model; prints the reply on stdout.
+llm_ask() {
+  local system="$1" user="$2"
+  command -v curl >/dev/null 2>&1 || { echo "⚠ curl is required for AI features" >&2; return 1; }
+  if ! llm_available; then
+    echo "⚠ Local LLM not reachable at ${LLM_URL} (${LLM_BACKEND}). Check it with: tunes ai test" >&2
+    return 1
+  fi
+  TUNES_LLM_SYSTEM="$system" LLM_API_KEY="$LLM_API_KEY" \
+    python3 -c "$LLM_PY" "$LLM_BACKEND" "$(llm_base)" "$LLM_MODEL" "$LLM_TIMEOUT" <<<"$user"
+}
+
 
 # Wrapper for desktop notifications
 desktop_notify() {
@@ -185,45 +435,6 @@ cleanup_stale_socket() {
   fi
 }
 
-# Checks Ollama is reachable; prints a helpful message once if not.
-ollama_available() {
-  curl -s --max-time 2 "${OLLAMA_URL}/api/tags" >/dev/null 2>&1
-}
-
-# Sends a prompt to the local model, returns raw text response on stdout.
-llm_ask() {
-  local system="$1" user="$2"
-  if ! ollama_available; then
-    echo "⚠ Ollama not reachable at ${OLLAMA_URL} (is it running?)" >&2
-    return 1
-  fi
-  python3 - "$OLLAMA_URL" "$OLLAMA_MODEL" "$system" "$user" <<'PYEOF'
-import sys, json, urllib.request
-url, model, system, user = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-payload = {
-    "model": model,
-    "prompt": user,
-    "system": system,
-    "stream": False,
-    "options": {"temperature": 0.7}
-}
-req = urllib.request.Request(
-    url.rstrip('/') + "/api/generate",
-    data=json.dumps(payload).encode(),
-    headers={"Content-Type": "application/json"}
-)
-try:
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        data = json.loads(resp.read().decode())
-        print(data.get("response", "").strip())
-except Exception as e:
-    print(f"__LLM_ERROR__ {e}", file=sys.stderr)
-    sys.exit(1)
-PYEOF
-}
-
-YTDL_ARGS="--ytdl-format=bestaudio/best --ytdl-raw-options=extractor-args=youtube:player_client=android"
-
 # Strip common YouTube title clutter so lyrics tools (sptlrx) can match artist/title.
 clean_title() {
   local t="$1"
@@ -238,77 +449,128 @@ clean_title() {
   echo "$t"
 }
 
-# Safely deduplicate TSV files by exact URL match (column 2)
+
+# Safely de-duplicate a TSV file by exact URL (column 2). Never truncates on failure.
 dedupe_tsv_by_url() {
   local file="$1" url="$2"
-  [[ ! -f "$file" ]] && return 0
-  awk -F'\t' -v u="$url" '$2 != u' "$file" > "$file.tmp" 2>/dev/null || true
-  mv "$file.tmp" "$file"
+  [[ -f "$file" ]] || return 0
+  if URL="$url" awk -F'\t' '$2 != ENVIRON["URL"]' "$file" > "$file.tmp" 2>/dev/null; then
+    mv "$file.tmp" "$file"
+  else
+    rm -f "$file.tmp"
+  fi
 }
 
+# Recently played list (unique tracks, newest first, capped at 200).
 log_history() {
-  local title="$1" url="$2"
+  local title url
+  title=$(sanitize_field "$1"); url=$(sanitize_field "$2")
+  [[ -z "$url" ]] && return 0
   dedupe_tsv_by_url "$HISTORY_FILE" "$url"
-  { echo -e "${title}\t${url}"; cat "$HISTORY_FILE" 2>/dev/null; } > "$HISTORY_FILE.tmp"
-  mv "$HISTORY_FILE.tmp" "$HISTORY_FILE"
-  # keep last 200
-  head -n 200 "$HISTORY_FILE" > "$HISTORY_FILE.tmp" && mv "$HISTORY_FILE.tmp" "$HISTORY_FILE"
+  { printf '%s\t%s\n' "$title" "$url"; cat "$HISTORY_FILE" 2>/dev/null || true; } > "$HISTORY_FILE.tmp"
+  head -n 200 "$HISTORY_FILE.tmp" > "$HISTORY_FILE"
+  rm -f "$HISTORY_FILE.tmp"
 }
 
-# Build common mpv script arguments (MPRIS2 and Notification integration)
-get_mpv_script_args() {
-  local args=()
-  local notify_script="$SCRIPTS_DIR/tunes-notify.lua"
-  local mpris_script="$SCRIPTS_DIR/mpris.so"
-  if [[ -f "$notify_script" ]]; then
-    args+=("--scripts-add=$notify_script")
+# ---------- mpv launcher ----------
+# All mpv arguments are built as arrays (no word-splitting surprises).
+
+YT_ARGS=()
+yt_args() {
+  YT_ARGS=(--ytdl-format=bestaudio/best)
+  if [[ -n "$YT_CLIENT" ]]; then
+    YT_ARGS+=("--ytdl-raw-options=extractor-args=youtube:player_client=$YT_CLIENT")
   fi
-  # If mpris.so is not already in ~/.config/mpv/scripts, load it explicitly
-  if [[ -f "$mpris_script" && ! -f "$HOME/.config/mpv/scripts/mpris.so" ]]; then
-    args+=("--scripts-add=$mpris_script")
+  return 0
+}
+
+MPV_BASE=()
+build_mpv_args() {
+  ensure_integration
+  ensure_tracker
+  MPV_BASE=(--input-ipc-server="$MPV_SOCKET")
+  [[ -f "$SCRIPTS_DIR/tunes-notify.lua" ]] && MPV_BASE+=(--scripts-append="$SCRIPTS_DIR/tunes-notify.lua")
+  [[ -f "$SCRIPTS_DIR/tunes-track.lua" ]] && MPV_BASE+=(--scripts-append="$SCRIPTS_DIR/tunes-track.lua")
+  if [[ -f "$SCRIPTS_DIR/mpris.so" && ! -f "$HOME/.config/mpv/scripts/mpris.so" ]]; then
+    MPV_BASE+=(--scripts-append="$SCRIPTS_DIR/mpris.so")
   fi
-  echo "${args[@]}"
+  if [[ "$DEFAULT_VOLUME" =~ ^[0-9]+$ ]]; then MPV_BASE+=(--volume="$DEFAULT_VOLUME"); fi
+  return 0
+}
+
+# Starting something new replaces whatever tunes is already playing.
+stop_previous() {
+  if mpv_ipc '["get_property","pid"]' 0 >/dev/null 2>&1; then
+    mpv_ipc '["quit"]' 0 >/dev/null 2>&1 || true
+    sleep 0.4
+  fi
+  cleanup_stale_socket
+}
+
+# launch_mpv <kind: music|podcast|video> <label> <mpv args...>
+launch_mpv() {
+  local kind="$1" label="$2"; shift 2
+  stop_previous
+  build_mpv_args
+  export TUNES_PLAYS_FILE="$PLAYS_FILE" TUNES_KIND="$kind"
+  if [[ "${DETACH:-0}" == "1" ]]; then
+    nohup mpv "${MPV_BASE[@]}" "$@" </dev/null >"$LOG_FILE" 2>&1 &
+    local pid=$!
+    disown "$pid"
+    echo "▶ $label (background)"
+    echo "  (PID $pid — control with: tunes ctl <action>, tunes status)"
+    desktop_notify "Now Playing (Background)" "$label" "audio-headphones"
+  else
+    echo "▶ $label"
+    mpv "${MPV_BASE[@]}" --term-osd-bar "$@" || true
+  fi
+  return 0
 }
 
 play_url() {
-  local title="$1" url="$2" clean loop_flag=""
+  local title="$1" url="$2" clean extra=()
   clean=$(clean_title "$title")
   log_history "$title" "$url"
-  cleanup_stale_socket
-
-  [[ "${LOOP:-0}" == "1" ]] && loop_flag="--loop-file=inf"
-  local script_args; script_args=$(get_mpv_script_args)
-
-  if [[ "${DETACH:-0}" == "1" ]]; then
-    echo "▶ Playing in background: $clean$( [[ -n "$loop_flag" ]] && echo ' (looping)' )"
-    nohup mpv --no-video --input-ipc-server="$MPV_SOCKET" \
-        $script_args \
-        $YTDL_ARGS \
-        --force-media-title="$clean" \
-        $loop_flag \
-        "$url" > "$DATA_DIR/tunes.log" 2>&1 &
-    local pid=$!
-    disown "$pid"
-    desktop_notify "Now Playing (Background)" "$clean" "audio-headphones"
-    echo "  (Process PID: $pid. Use 'tunes status' or 'tunes ctl' to control playback)"
-  else
-    echo "▶ Playing: $clean$( [[ -n "$loop_flag" ]] && echo ' (looping)' )"
-    mpv --no-video --input-ipc-server="$MPV_SOCKET" \
-        $script_args \
-        $YTDL_ARGS \
-        --force-media-title="$clean" \
-        $loop_flag \
-        --term-osd-bar \
-        "$url"
-  fi
+  [[ "${LOOP:-0}" == "1" ]] && extra+=(--loop-file=inf)
+  yt_args
+  local suffix=""; [[ "${LOOP:-0}" == "1" ]] && suffix=" (looping)"
+  launch_mpv music "Playing: ${clean}${suffix}" --no-video "${YT_ARGS[@]}" \
+    --force-media-title="$clean" "${extra[@]}" "$url"
 }
+
+# play_queue <label> <tsv>   (each line: title<TAB>url[<TAB>...])
+play_queue() {
+  local label="$1" tsv="$2" title url rest clean count=0
+  printf '#EXTM3U\n' > "$QUEUE_FILE"
+  while IFS=$'\t' read -r title url rest; do
+    [[ -z "$url" ]] && continue
+    clean=$(clean_title "$title")
+    log_history "$title" "$url"
+    printf '#EXTINF:-1,%s\n%s\n' "$clean" "$url" >> "$QUEUE_FILE"
+    count=$((count + 1))
+  done <<< "$tsv"
+  if ((count == 0)); then echo "Nothing to play."; return 0; fi
+  local extra=()
+  [[ "${LOOP:-0}" == "1" ]] && extra+=(--loop-playlist=inf)
+  [[ "${SHUFFLE:-0}" == "1" ]] && extra+=(--shuffle)
+  yt_args
+  launch_mpv music "$label ($count tracks)" --no-video "${YT_ARGS[@]}" "${extra[@]}" "$QUEUE_FILE"
+}
+
+# ---------- search / pickers ----------
 
 search_and_pick() {
-  local query="$1" count="${2:-15}"
+  local query="$1" count="${2:-15}" out
   echo "Searching: $query ..." >&2
-  yt-dlp "ytsearch${count}:${query}" --flat-playlist -j 2>/dev/null \
-    | jq -r '"\(.title)\t\(.url // ("https://www.youtube.com/watch?v=" + .id))\t\(.channel // .uploader // "")\t\(.duration_string // "")"'
+  out=$(yt-dlp "ytsearch${count}:${query}" --flat-playlist -j 2>/dev/null || true)
+  if [[ -z "$out" ]]; then
+    echo "No results (network down, or yt-dlp is outdated — try: yt-dlp -U)." >&2
+    return 0
+  fi
+  jq -r '[.title, (.url // ("https://www.youtube.com/watch?v=" + .id)), (.channel // .uploader // ""), (.duration_string // "")]
+         | map(tostring | gsub("[\\t\\n\\r]"; " ")) | join("\t")' <<<"$out" 2>/dev/null || true
 }
+
 
 pick_from_list() {
   local prompt="${1:-🎵 > }"
@@ -330,13 +592,13 @@ top_words() {
     | head -n "$n" | awk '{print $2}'
 }
 
-# Cleans up numbered/bulleted/quoted LLM output into plain lines, capped at N.
+# Cleans numbered/bulleted/quoted LLM output into plain lines, capped at N.
 llm_lines_to_list() {
   local n="${1:-5}"
-  sed -E 's/^[[:space:]]*[-*0-9.)]+[[:space:]]*//' \
-    | sed -E 's/^"(.*)"$/\1/' \
-    | grep -v '^\s*$' \
-    | head -n "$n"
+  sed -E 's/\r$//; s/^[[:space:]]*([-*•]+|[0-9]+[.):])[[:space:]]*//; s/^[[:space:]]*([-*•]+|[0-9]+[.):])[[:space:]]*//' \
+    | sed -E 's/^[[:space:]]*[*_"`]+//; s/[*_"`]+[[:space:]]*$//' \
+    | grep -v '^[[:space:]]*$' \
+    | head -n "$n" || true
 }
 
 # ---------- podcast helpers (RSS via python3, no extra deps) ----------
@@ -395,7 +657,15 @@ for r in data.get('results', []):
   return 0
 }
 
-# ---------- commands ----------
+
+pick_multi() {
+  local prompt="${1:-🎵 select (tab) > }"
+  fzf --multi --delimiter='\t' --with-nth=1,3,4 --prompt="$prompt" --height=60% --border --reverse \
+      --preview='echo -e "Title:    \033[1m{1}\033[0m\nChannel:  {3}\nDuration: {4}\nURL:      {2}"' \
+      --preview-window="down:4:wrap:hidden" --bind="?:toggle-preview"
+}
+
+# ---------- commands: search & playback ----------
 
 cmd_search() {
   local query="${1:-}"
@@ -404,54 +674,17 @@ cmd_search() {
   local selection
   selection=$(search_and_pick "$query" | pick_from_list "🎵 > ") || { echo "Cancelled."; exit 0; }
   [[ -z "$selection" ]] && exit 0
-  local title url
-  title=$(cut -f1 <<<"$selection")
-  url=$(cut -f2 <<<"$selection")
-  play_url "$title" "$url"
+  play_url "$(cut -f1 <<<"$selection")" "$(cut -f2 <<<"$selection")"
 }
 
 cmd_queue() {
-  # multi-select search -> builds an mpv playlist
   local query="${1:-}"
   [[ -z "$query" ]] && read -rp "Search (queue mode): " query
   [[ -z "$query" ]] && exit 0
   local selections
-  selections=$(search_and_pick "$query" | fzf --multi --delimiter='\t' --with-nth=1,3,4 \
-      --prompt="🎵 select multiple (tab) > " --height=60% --border --reverse \
-      --preview='echo -e "Title:    \033[1m{1}\033[0m\nChannel:  {3}\nDuration: {4}\nURL:      {2}"' \
-      --preview-window="down:4:wrap:hidden" --bind="?:toggle-preview") || exit 0
+  selections=$(search_and_pick "$query" | pick_multi "🎵 select multiple (tab) > ") || exit 0
   [[ -z "$selections" ]] && exit 0
-
-  local playlist_file; playlist_file=$(mktemp /tmp/tunes-queue-XXXX.m3u)
-  local count=0
-  while IFS=$'\t' read -r title url channel duration; do
-    [[ -z "$url" ]] && continue
-    local clean; clean=$(clean_title "$title")
-    log_history "$title" "$url"
-    { echo "#EXTINF:-1,${clean}"; echo "$url"; } >> "$playlist_file"
-    count=$((count+1))
-  done <<< "$selections"
-
-  cleanup_stale_socket
-  local loop_flag="" shuffle_flag=""
-  [[ "${LOOP:-0}" == "1" ]] && loop_flag="--loop-playlist=inf"
-  [[ "${SHUFFLE:-0}" == "1" ]] && shuffle_flag="--shuffle"
-  local script_args; script_args=$(get_mpv_script_args)
-
-  if [[ "${DETACH:-0}" == "1" ]]; then
-    echo "▶ Playing queue of ${count} tracks in background"
-    nohup mpv --no-video --input-ipc-server="$MPV_SOCKET" \
-        $script_args $YTDL_ARGS $loop_flag $shuffle_flag "$playlist_file" > "$DATA_DIR/tunes.log" 2>&1 &
-    local pid=$!
-    disown "$pid"
-    desktop_notify "Queue Started (Background)" "Playing ${count} tracks" "audio-headphones"
-    echo "  (Process PID: $pid. Use 'tunes status' or 'tunes ctl' to control)"
-  else
-    echo "▶ Playing queue of ${count} tracks"
-    mpv --no-video --input-ipc-server="$MPV_SOCKET" \
-        $script_args $YTDL_ARGS $loop_flag $shuffle_flag --term-osd-bar "$playlist_file"
-    rm -f "$playlist_file"
-  fi
+  play_queue "Queue" "$selections"
 }
 
 cmd_video() {
@@ -461,46 +694,38 @@ cmd_video() {
   local selection
   selection=$(search_and_pick "$query" | pick_from_list "🎬 > ") || { echo "Cancelled."; exit 0; }
   [[ -z "$selection" ]] && exit 0
-  local title url clean
-  title=$(cut -f1 <<<"$selection")
-  url=$(cut -f2 <<<"$selection")
+  local title url clean extra=()
+  title=$(cut -f1 <<<"$selection"); url=$(cut -f2 <<<"$selection")
   clean=$(clean_title "$title")
   log_history "$title" "$url"
-  cleanup_stale_socket
-
-  local loop_flag=""
-  [[ "${LOOP:-0}" == "1" ]] && loop_flag="--loop-file=inf"
-  local script_args; script_args=$(get_mpv_script_args)
-  echo "▶ Playing (video): $clean"
-  mpv --input-ipc-server="$MPV_SOCKET" \
-      $script_args \
-      $YTDL_ARGS \
-      --force-media-title="$clean" \
-      $loop_flag \
-      "$url"
+  [[ "${LOOP:-0}" == "1" ]] && extra+=(--loop-file=inf)
+  # video mode needs a real video format (the audio-only selector would show nothing)
+  launch_mpv music "Playing (video): $clean" "--ytdl-format=bv*[height<=1080]+ba/b" \
+    --force-media-title="$clean" "${extra[@]}" "$url"
 }
 
 cmd_vlc() {
   local query="${1:-}"
   [[ -z "$query" ]] && read -rp "Search (VLC): " query
   [[ -z "$query" ]] && exit 0
+  require vlc
   local selection
   selection=$(search_and_pick "$query" | pick_from_list "🟠 VLC > ") || { echo "Cancelled."; exit 0; }
   [[ -z "$selection" ]] && exit 0
-  local title url clean resolved
-  title=$(cut -f1 <<<"$selection")
-  url=$(cut -f2 <<<"$selection")
+  local title url clean resolved ytargs=(-f "bestaudio/best") extra=()
+  title=$(cut -f1 <<<"$selection"); url=$(cut -f2 <<<"$selection")
   clean=$(clean_title "$title")
   log_history "$title" "$url"
+  [[ -n "$YT_CLIENT" ]] && ytargs+=(--extractor-args "youtube:player_client=$YT_CLIENT")
   echo "Resolving stream URL..."
-  resolved=$(yt-dlp -f "bestaudio/best" --extractor-args "youtube:player_client=android" -g "$url" 2>/dev/null | head -1 || true)
+  resolved=$(yt-dlp "${ytargs[@]}" -g "$url" 2>/dev/null | head -1 || true)
   [[ -z "$resolved" ]] && { echo "Failed to resolve stream."; exit 1; }
-  local loop_flag=""
-  [[ "${LOOP:-0}" == "1" ]] && loop_flag="--loop=-1"
-  echo "▶ Opening in VLC: $clean"
-  vlc --meta-title="$clean" $loop_flag "$resolved" >/dev/null 2>&1 &
+  [[ "${LOOP:-0}" == "1" ]] && extra+=(--loop)
+  echo "▶ Opening in VLC (plays in VLC are not counted in your stats): $clean"
+  vlc --meta-title="$clean" "${extra[@]}" "$resolved" >/dev/null 2>&1 &
   disown
 }
+
 
 # Direct play of URL, audio stream, local file or directory
 cmd_play() {
@@ -509,6 +734,7 @@ cmd_play() {
   [[ -z "$target" ]] && exit 0
   if [[ -f "$target" || -d "$target" ]]; then
     local name
+    target=$(readlink -f -- "$target" 2>/dev/null || printf '%s' "$target")
     name=$(basename "$target")
     play_url "$name" "$target"
   else
@@ -532,7 +758,7 @@ cmd_favorite_add() {
   local url
   url=$(cut -f2 <<<"$selection")
   dedupe_tsv_by_url "$FAVORITES_FILE" "$url"
-  { echo "$selection"; cat "$FAVORITES_FILE" 2>/dev/null; } > "$FAVORITES_FILE.tmp"
+  { printf '%s\n' "$selection"; cat "$FAVORITES_FILE" 2>/dev/null || true; } > "$FAVORITES_FILE.tmp"
   mv "$FAVORITES_FILE.tmp" "$FAVORITES_FILE"
   echo "★ Added to favorites: $(cut -f1 <<<"$selection")"
   desktop_notify "Favorites" "Added: $(cut -f1 <<<"$selection")" "emblem-favorite"
@@ -567,6 +793,8 @@ cmd_download() {
   local title url
   title=$(cut -f1 <<<"$selection")
   url=$(cut -f2 <<<"$selection")
+  command -v ffmpeg >/dev/null 2>&1 || { echo "mp3 downloads need ffmpeg ($(install_hint ffmpeg))"; exit 1; }
+  mkdir -p "$DOWNLOAD_DIR"
   echo "⬇ Downloading to $DOWNLOAD_DIR ..."
   desktop_notify "Downloading Track" "$title" "emblem-downloads"
   yt-dlp -x --audio-format mp3 --audio-quality 0 \
@@ -592,19 +820,31 @@ cmd_status() {
     return 0
   fi
   python3 - "$MPV_SOCKET" <<'PYEOF'
-import sys, socket, json
+import sys, socket, json, signal
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # no traceback when piped into head/grep -q
 
 def query(prop):
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(0.5)
+        s.settimeout(1.0)
         s.connect(sys.argv[1])
-        s.sendall(json.dumps({"command": ["get_property", prop]}).encode('utf-8') + b"\n")
-        s.shutdown(socket.SHUT_WR)
-        resp = s.recv(4096)
+        s.sendall((json.dumps({"command": ["get_property", prop], "request_id": 7}) + "\n").encode('utf-8'))
+        buf = b""
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                try:
+                    msg = json.loads(line)
+                except Exception:
+                    continue
+                if msg.get("request_id") == 7:
+                    s.close()
+                    return msg.get("data") if msg.get("error") == "success" else None
         s.close()
-        if resp:
-            return json.loads(resp.decode('utf-8', errors='ignore')).get("data")
     except Exception:
         pass
     return None
@@ -657,7 +897,7 @@ cmd_notify() {
     echo "Tunes is not currently playing."
     return 0
   fi
-  local title paused pos dur vol
+  local title paused vol
   title=$(mpv_ipc '["get_property", "media-title"]' 1 || echo "Unknown Track")
   paused=$(mpv_ipc '["get_property", "pause"]' 1 || echo "false")
   vol=$(mpv_ipc '["get_property", "volume"]' 1 || echo "100")
@@ -670,6 +910,12 @@ cmd_notify() {
 # Extended transport controls with desktop feedback
 cmd_ctl() {
   local action="${1:-}" arg="${2:-}"
+  case "$action" in
+    vol-up|vol-down|vol|mute|seek|speed|loop-on|loop-off|loop-toggle|queue|list|jump|goto)
+      if ! mpv_ipc '["get_property","pid"]' 0 >/dev/null 2>&1; then
+        echo "Nothing is playing."; return 1
+      fi ;;
+  esac
   case "$action" in
     pause|play-pause)
       if mpv_ipc '["cycle", "pause"]' 0; then
@@ -707,6 +953,7 @@ cmd_ctl() {
       ;;
     vol-up)
       local step="${arg:-5}"
+      [[ "$step" =~ ^[0-9]+$ ]] || { echo "Usage: tunes ctl vol-up|vol-down [percent]"; exit 1; }
       mpv_ipc "[\"add\", \"volume\", ${step}]" 0
       local vol
       vol=$(mpv_ipc '["get_property", "volume"]' 1 || echo "100")
@@ -716,6 +963,7 @@ cmd_ctl() {
       ;;
     vol-down)
       local step="${arg:-5}"
+      [[ "$step" =~ ^[0-9]+$ ]] || { echo "Usage: tunes ctl vol-up|vol-down [percent]"; exit 1; }
       mpv_ipc "[\"add\", \"volume\", -${step}]" 0
       local vol
       vol=$(mpv_ipc '["get_property", "volume"]' 1 || echo "100")
@@ -724,7 +972,7 @@ cmd_ctl() {
       echo "🔉 Volume: ${vol}%"
       ;;
     vol)
-      [[ -z "$arg" ]] && { echo "Usage: tunes ctl vol <0-100>"; exit 1; }
+      [[ "$arg" =~ ^[0-9]+$ ]] && ((arg <= 150)) || { echo "Usage: tunes ctl vol <0-100>"; exit 1; }
       mpv_ipc "[\"set_property\", \"volume\", ${arg}]" 0
       desktop_notify "Volume" "${arg}%" "audio-volume-high" -h "string:x-canonical-private-synchronous:tunes-volume" -h "int:value:${arg}"
       echo "🔊 Volume set to: ${arg}%"
@@ -743,11 +991,14 @@ cmd_ctl() {
       ;;
     seek)
       local offset="${arg:-+10}"
+      [[ "$offset" =~ ^[+-]?[0-9]+(\.[0-9]+)?$ ]] || { echo "Usage: tunes ctl seek <+/-seconds>"; exit 1; }
+      offset="${offset#+}"   # JSON has no leading plus
       mpv_ipc "[\"seek\", ${offset}]" 0
       echo "⏩ Seeked ${offset}s"
       ;;
     speed)
       local sp="${arg:-1.0}"
+      [[ "$sp" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "Usage: tunes ctl speed <rate, e.g. 1.25>"; exit 1; }
       mpv_ipc "[\"set_property\", \"speed\", ${sp}]" 0
       desktop_notify "Speed" "${sp}x" "media-playback-start"
       echo "⚡ Playback speed: ${sp}x"
@@ -772,6 +1023,17 @@ cmd_ctl() {
         desktop_notify "Tunes" "Loop Disabled" "media-playlist-repeat"
       fi
       ;;
+    queue|list)
+      local pl
+      pl=$(mpv_ipc '["get_property","playlist"]' 2) || { echo "Nothing is playing."; return 0; }
+      python3 -c 'import sys,json
+for i, e in enumerate(json.load(sys.stdin), 1):
+    print("%s %2d. %s" % ("▶" if e.get("current") else " ", i, e.get("title") or e.get("filename")))' <<<"$pl"
+      ;;
+    jump|goto)
+      [[ "$arg" =~ ^[0-9]+$ ]] && ((arg >= 1)) || { echo "Usage: tunes ctl jump <queue number>"; exit 1; }
+      mpv_ipc "[\"playlist-play-index\", $((arg - 1))]" 0 && echo "⏭ Jumped to #$arg" || echo "No such queue entry."
+      ;;
     status|info|np)
       cmd_status
       ;;
@@ -781,6 +1043,8 @@ Usage: tunes ctl {action} [args]
 
 Actions:
   pause, play-pause     Toggle play/pause
+  queue                 Show the current queue
+  jump <n>              Jump to queue position n
   play                  Resume playback
   stop, quit            Stop playback and exit
   next                  Next track
@@ -800,150 +1064,165 @@ EOF
   esac
 }
 
-# ---------- playlist management ----------
+# ---------- playlists ----------
+
+playlist_path() { printf '%s/%s.tsv' "$PLAYLISTS_DIR" "$(sanitize_name "$1")"; }
+
+# fzf over saved playlists; prints the chosen name
+pick_playlist() {
+  local names=() f
+  for f in "$PLAYLISTS_DIR"/*.tsv; do
+    if [[ -f "$f" ]]; then names+=("$(basename "$f" .tsv)"); fi
+  done
+  if ((${#names[@]} == 0)); then
+    echo "No playlists yet. Create one with: tunes playlist create <name>" >&2
+    return 1
+  fi
+  printf '%s\n' "${names[@]}" | fzf --prompt="📂 playlist > " --height=40% --border --reverse
+}
 
 cmd_playlist() {
   local sub="${1:-list}"; shift || true
+  local name="" pl_file=""
   case "$sub" in
     list|"")
       echo "📂 Saved Playlists:"
-      local count=0
+      local count=0 pl tracks
       for pl in "$PLAYLISTS_DIR"/*.tsv; do
-        [[ ! -f "$pl" ]] && continue
-        local name; name=$(basename "$pl" .tsv)
-        local tracks; tracks=$(wc -l < "$pl" | tr -d ' ')
-        printf "  • %-20s (%d tracks)\n" "$name" "$tracks"
-        count=$((count+1))
+        [[ -f "$pl" ]] || continue
+        tracks=$(grep -c . "$pl" 2>/dev/null || true)
+        printf "  • %-24s (%d tracks)\n" "$(basename "$pl" .tsv)" "${tracks:-0}"
+        count=$((count + 1))
       done
-      [[ $count -eq 0 ]] && echo "  (No playlists yet. Use: tunes playlist create <name>)"
+      if ((count == 0)); then echo "  (No playlists yet. Use: tunes playlist create <name>)"; fi
       ;;
     create)
-      local name="${1:-}"
+      name="${1:-}"
       [[ -z "$name" ]] && read -rp "Playlist name: " name
-      [[ -z "$name" ]] && exit 0
-      local pl_file="$PLAYLISTS_DIR/${name}.tsv"
-      touch "$pl_file"
+      name=$(sanitize_name "$name"); [[ -z "$name" ]] && exit 0
+      touch "$(playlist_path "$name")"
       echo "✔ Playlist created: $name"
       ;;
     add)
-      local name="${1:-}" query="${2:-}"
+      name="${1:-}"; local query="${2:-}"
       [[ -z "$name" ]] && read -rp "Playlist name to add to: " name
-      [[ -z "$name" ]] && exit 0
-      local pl_file="$PLAYLISTS_DIR/${name}.tsv"
-      [[ ! -f "$pl_file" ]] && touch "$pl_file"
-      local selection
-      if [[ -n "$query" ]]; then
-        selection=$(search_and_pick "$query" | pick_from_list "Add to $name > ") || exit 0
+      name=$(sanitize_name "$name"); [[ -z "$name" ]] && exit 0
+      pl_file=$(playlist_path "$name"); touch "$pl_file"
+      local selection title url
+      if [[ "$query" == "--now" || "$query" == "now" ]]; then
+        title=$(mpv_ipc '["get_property","media-title"]' 1 2>/dev/null) || { echo "Nothing is playing."; exit 1; }
+        url=$(mpv_ipc '["get_property","path"]' 1 2>/dev/null) || { echo "Nothing is playing."; exit 1; }
       else
-        selection=$(pick_from_list "Add from history > " < "$HISTORY_FILE") || exit 0
+        if [[ -n "$query" ]]; then
+          selection=$(search_and_pick "$query" | pick_from_list "Add to $name > ") || exit 0
+        else
+          selection=$(pick_from_list "Add from history > " < "$HISTORY_FILE") || exit 0
+        fi
+        [[ -z "$selection" ]] && exit 0
+        title=$(cut -f1 <<<"$selection"); url=$(cut -f2 <<<"$selection")
       fi
-      [[ -z "$selection" ]] && exit 0
-      local title url
-      title=$(cut -f1 <<<"$selection")
-      url=$(cut -f2 <<<"$selection")
       dedupe_tsv_by_url "$pl_file" "$url"
-      echo -e "${title}\t${url}" >> "$pl_file"
+      printf '%s\t%s\n' "$(sanitize_field "$title")" "$url" >> "$pl_file"
       echo "✔ Added '$title' to playlist '$name'"
       desktop_notify "Playlist Updated" "Added to $name: $title" "audio-x-generic"
       ;;
     play)
-      local name="${1:-}"
-      [[ -z "$name" ]] && read -rp "Playlist name to play: " name
-      [[ -z "$name" ]] && exit 0
-      local pl_file="$PLAYLISTS_DIR/${name}.tsv"
-      [[ ! -s "$pl_file" ]] && { echo "Playlist '$name' not found or empty."; exit 1; }
-
-      local m3u_file; m3u_file=$(mktemp /tmp/tunes-pl-XXXX.m3u)
-      local count=0
-      while IFS=$'\t' read -r title url; do
-        [[ -z "$url" ]] && continue
-        local clean; clean=$(clean_title "$title")
-        log_history "$title" "$url"
-        { echo "#EXTINF:-1,${clean}"; echo "$url"; } >> "$m3u_file"
-        count=$((count+1))
-      done < "$pl_file"
-
-      cleanup_stale_socket
-      local loop_flag="" shuffle_flag=""
-      [[ "${LOOP:-0}" == "1" ]] && loop_flag="--loop-playlist=inf"
-      [[ "${SHUFFLE:-0}" == "1" ]] && shuffle_flag="--shuffle"
-      local script_args; script_args=$(get_mpv_script_args)
-
-      if [[ "${DETACH:-0}" == "1" ]]; then
-        echo "▶ Playing playlist '$name' (${count} tracks) in background"
-        nohup mpv --no-video --input-ipc-server="$MPV_SOCKET" \
-            $script_args $YTDL_ARGS $loop_flag $shuffle_flag "$m3u_file" > "$DATA_DIR/tunes.log" 2>&1 &
-        local pid=$!
-        disown "$pid"
-        desktop_notify "Playlist: $name" "Playing ${count} tracks in background" "audio-headphones"
-      else
-        echo "▶ Playing playlist '$name' (${count} tracks)"
-        mpv --no-video --input-ipc-server="$MPV_SOCKET" \
-            $script_args $YTDL_ARGS $loop_flag $shuffle_flag --term-osd-bar "$m3u_file"
-        rm -f "$m3u_file"
-      fi
+      name="${1:-}"
+      [[ -z "$name" ]] && { name=$(pick_playlist) || exit 0; }
+      pl_file=$(playlist_path "$name")
+      [[ -s "$pl_file" ]] || { echo "Playlist '$name' not found or empty."; exit 1; }
+      play_queue "Playlist '$name'" "$(cat "$pl_file")"
       ;;
     view)
-      local name="${1:-}"
-      [[ -z "$name" ]] && read -rp "Playlist name: " name
-      [[ -z "$name" ]] && exit 0
-      local pl_file="$PLAYLISTS_DIR/${name}.tsv"
-      [[ ! -s "$pl_file" ]] && { echo "Playlist '$name' is empty or does not exist."; exit 1; }
+      name="${1:-}"
+      [[ -z "$name" ]] && { name=$(pick_playlist) || exit 0; }
+      pl_file=$(playlist_path "$name")
+      [[ -s "$pl_file" ]] || { echo "Playlist '$name' is empty or does not exist."; exit 1; }
       echo "Tracks in '$name':"
       nl -ba -w2 -s'. ' <(cut -f1 "$pl_file")
       ;;
+    remove)
+      name="${1:-}"
+      [[ -z "$name" ]] && { name=$(pick_playlist) || exit 0; }
+      pl_file=$(playlist_path "$name")
+      [[ -s "$pl_file" ]] || { echo "Playlist '$name' is empty or does not exist."; exit 1; }
+      local sel
+      sel=$(pick_from_list "🗑 Remove from $name > " < "$pl_file") || exit 0
+      [[ -z "$sel" ]] && exit 0
+      dedupe_tsv_by_url "$pl_file" "$(cut -f2 <<<"$sel")"
+      echo "✔ Removed '$(cut -f1 <<<"$sel")' from '$name'"
+      ;;
     delete)
-      local name="${1:-}"
-      [[ -z "$name" ]] && read -rp "Playlist name to delete: " name
-      [[ -z "$name" ]] && exit 0
-      local pl_file="$PLAYLISTS_DIR/${name}.tsv"
-      if [[ -f "$pl_file" ]]; then
-        rm -f "$pl_file"
-        echo "✔ Deleted playlist: $name"
-      else
-        echo "Playlist '$name' not found."
-      fi
+      name="${1:-}"
+      [[ -z "$name" ]] && { name=$(pick_playlist) || exit 0; }
+      pl_file=$(playlist_path "$name")
+      if [[ -f "$pl_file" ]]; then rm -f "$pl_file"; echo "✔ Deleted playlist: $name"
+      else echo "Playlist '$name' not found."; fi
       ;;
     *)
-      echo "Usage: tunes playlist {list|create|add|play|view|delete} [name]"; exit 1 ;;
+      echo "Usage: tunes playlist {list|create|add|play|view|remove|delete} [name]"
+      echo "       tunes playlist add <name> --now     (adds the track playing right now)"
+      exit 1 ;;
   esac
 }
 
-# ---------- podcast commands ----------
+# ---------- podcast playback ----------
 
 play_podcast_url() {
-  local title="$1" url="$2" feed_name="${3:-}" loop_flag=""
+  local title url feed_name extra=()
+  title=$(sanitize_field "$1"); url="$2"; feed_name=$(sanitize_field "${3:-}")
   dedupe_tsv_by_url "$POD_HISTORY_FILE" "$url"
-  { echo -e "${title}\t${url}\t${feed_name}"; cat "$POD_HISTORY_FILE" 2>/dev/null; } > "$POD_HISTORY_FILE.tmp"
-  mv "$POD_HISTORY_FILE.tmp" "$POD_HISTORY_FILE"
-  head -n 300 "$POD_HISTORY_FILE" > "$POD_HISTORY_FILE.tmp" && mv "$POD_HISTORY_FILE.tmp" "$POD_HISTORY_FILE"
-  cleanup_stale_socket
-
-  [[ "${LOOP:-0}" == "1" ]] && loop_flag="--loop-file=inf"
-  local script_args; script_args=$(get_mpv_script_args)
-
-  if [[ "${DETACH:-0}" == "1" ]]; then
-    echo "🎙 Playing in background: $title"
-    nohup mpv --no-video --input-ipc-server="$MPV_SOCKET" \
-        $script_args \
-        --force-media-title="$title" \
-        --save-position-on-quit \
-        $loop_flag \
-        "$url" > "$DATA_DIR/tunes.log" 2>&1 &
-    local pid=$!
-    disown "$pid"
-    desktop_notify "Podcast (Background)" "$title" "audio-headphones"
-    echo "  (Process PID: $pid. Use 'tunes status' or 'tunes ctl' to control)"
-  else
-    echo "🎙 Playing: $title"
-    mpv --no-video --input-ipc-server="$MPV_SOCKET" \
-        $script_args \
-        --force-media-title="$title" \
-        --save-position-on-quit \
-        $loop_flag --term-osd-bar \
-        "$url"
-  fi
+  { printf '%s\t%s\t%s\n' "$title" "$url" "$feed_name"; cat "$POD_HISTORY_FILE" 2>/dev/null || true; } > "$POD_HISTORY_FILE.tmp"
+  head -n 300 "$POD_HISTORY_FILE.tmp" > "$POD_HISTORY_FILE"
+  rm -f "$POD_HISTORY_FILE.tmp"
+  [[ "${LOOP:-0}" == "1" ]] && extra+=(--loop-file=inf)
+  launch_mpv podcast "Podcast: $title" --no-video --force-media-title="$title" \
+    --save-position-on-quit "${extra[@]}" "$url"
 }
+
+# ---------- natural language / mood search (local LLM) ----------
+
+cmd_mood() {
+  local desc="${1:-}"
+  [[ -z "$desc" ]] && read -rp "Describe what you want to listen to: " desc
+  [[ -z "$desc" ]] && exit 0
+
+  if ! llm_available; then
+    echo "⚠ No local LLM reachable at ${LLM_URL} — using a plain search for: $desc"
+    echo "  (connect one with: tunes ai setup)"
+    cmd_search "$desc"
+    return 0
+  fi
+
+  echo "Thinking about: \"$desc\" ..." >&2
+  local sys="You turn a mood or vibe description into good YouTube search queries for music. Reply with ONLY 5 short search queries, one per line, no numbering, no explanation, no quotes."
+  local raw queries
+  raw=$(llm_ask "$sys" "$desc" 2>/dev/null) || raw=""
+  queries=$(echo "$raw" | llm_lines_to_list 5 || true)
+  if [[ -z "$queries" ]]; then
+    echo "The model gave no usable output — using a plain search instead."
+    cmd_search "$desc"
+    return 0
+  fi
+
+  echo "Searching for:"
+  echo "$queries" | sed 's/^/  • /'
+  local combined="" q
+  while IFS= read -r q; do
+    [[ -z "$q" ]] && continue
+    combined+="$(search_and_pick "$q" 6 || true)"$'\n'
+  done <<< "$queries"
+  combined=$(printf '%s' "$combined" | awk -F'\t' 'NF >= 2 && !seen[$2]++')
+  [[ -z "$combined" ]] && { echo "No results found."; exit 0; }
+
+  local selections
+  selections=$(printf '%s\n' "$combined" | pick_multi "🎵 mood: $desc (tab to multi-select) > ") || exit 0
+  [[ -z "$selections" ]] && exit 0
+  play_queue "Mood: $desc" "$selections"
+}
+
+
+# ---------- podcast commands ----------
 
 cmd_podcast_add() {
   local query="${1:-}"
@@ -960,7 +1239,7 @@ cmd_podcast_add() {
   name=$(cut -f1 <<<"$selection")
   url=$(cut -f2 <<<"$selection")
   dedupe_tsv_by_url "$FEEDS_FILE" "$url"
-  echo -e "${name}\t${url}" >> "$FEEDS_FILE"
+  printf '%s\t%s\n' "$(sanitize_field "$name")" "$url" >> "$FEEDS_FILE"
   echo "✔ Subscribed to: $name"
   desktop_notify "Podcast Subscribed" "$name" "emblem-favorite"
 }
@@ -982,7 +1261,7 @@ except Exception:
 " || echo "Podcast")
   fi
   dedupe_tsv_by_url "$FEEDS_FILE" "$url"
-  echo -e "${name}\t${url}" >> "$FEEDS_FILE"
+  printf '%s\t%s\n' "$(sanitize_field "$name")" "$url" >> "$FEEDS_FILE"
   echo "✔ Subscribed to: $name ($url)"
   desktop_notify "Podcast Subscribed" "$name" "emblem-favorite"
 }
@@ -1001,7 +1280,7 @@ cmd_podcast_remove() {
 
 cmd_podcast_feeds() {
   [[ ! -s "$FEEDS_FILE" ]] && { echo "No subscriptions yet. Use: tunes pod-add \"<name>\""; exit 0; }
-  column -t -s $'\t' "$FEEDS_FILE"
+  awk -F'\t' '{ printf "  %-34s %s\n", $1, $2 }' "$FEEDS_FILE"
 }
 
 cmd_podcast_play() {
@@ -1048,13 +1327,13 @@ cmd_podcast_download() {
   local title url target_dir
   title=$(cut -f1 <<<"$ep_selection")
   url=$(cut -f2 <<<"$ep_selection")
-  target_dir="$POD_DOWNLOAD_DIR/$feed_name"
+  target_dir="$POD_DOWNLOAD_DIR/$(sanitize_name "$feed_name")"
   mkdir -p "$target_dir"
-  local clean_fname; clean_fname=$(echo "$title" | tr -c 'a-zA-Z0-9 _-' '_')
+  local clean_fname; clean_fname=$(printf '%s' "$title" | tr -c 'a-zA-Z0-9 _-' '_')
   local out_file="$target_dir/${clean_fname}.mp3"
   echo "⬇ Downloading '$title' to $out_file ..."
   desktop_notify "Downloading Episode" "$title" "emblem-downloads"
-  curl -L --max-time 600 -o "$out_file" "$url"
+  curl -fL --max-time 1800 -o "$out_file" "$url"
   echo "✔ Saved to: $out_file"
   desktop_notify "Podcast Downloaded" "$title" "emblem-default"
 }
@@ -1066,17 +1345,18 @@ cmd_recommend_music() {
   local keywords played
   played=$(cut -f2 "$HISTORY_FILE" | grep -v '^\s*$' || true)
 
-  if ollama_available; then
-    echo "Asking Llama 3.2 to read your listening history..." >&2
-    local recent; recent=$(cut -f1 "$HISTORY_FILE" | head -n 30)
+  if llm_available; then
+    echo "Asking your local model to read your listening history..." >&2
+    local recent
+    recent=$({ stats_engine top --period all --limit 15 | cut -f1 || true; cut -f1 "$HISTORY_FILE" | awk 'NR <= 15'; } | awk '!s[$0]++')
     local sys="You are a music recommendation assistant. Given a list of recently played track titles, infer the listener's taste (genre, mood, era, artists) and suggest 5 short YouTube search queries for NEW tracks they'd likely enjoy — similar vein, but not the same songs. Reply with ONLY the 5 queries, one per line, no numbering, no explanation."
     local raw; raw=$(llm_ask "$sys" "$recent" 2>/dev/null) || raw=""
-    keywords=$(echo "$raw" | llm_lines_to_list 5)
+    keywords=$(echo "$raw" | llm_lines_to_list 5 || true)
   fi
 
   if [[ -z "${keywords:-}" ]]; then
     echo "Falling back to keyword analysis of your history..." >&2
-    keywords=$(cut -f1 "$HISTORY_FILE" | top_words 3)
+    keywords=$(cut -f1 "$HISTORY_FILE" | top_words 3 || true)
   fi
   [[ -z "$keywords" ]] && { echo "Not enough history to build recommendations yet."; exit 0; }
 
@@ -1089,7 +1369,7 @@ cmd_recommend_music() {
   done <<< "$keywords"
 
   local filtered
-  filtered=$(echo "$combined" | grep -v '^\s*$' | awk -F'\t' '!seen[$2]++')
+  filtered=$(echo "$combined" | awk -F'\t' 'NF >= 2 && !seen[$2]++')
   if [[ -n "$played" ]]; then
     filtered=$(awk -F'\t' '
       NR==FNR {
@@ -1122,11 +1402,11 @@ cmd_recommend_podcast() {
       all_new+="${etitle}"$'\t'"${eurl}"$'\t'"${ename}"$'\t'"${epub}"$'\n'
     done <<< "$eps"
   done < "$FEEDS_FILE"
-  all_new=$(echo "$all_new" | grep -v '^\s*$')
+  all_new=$(echo "$all_new" | grep -v '^\s*$' || true)
   [[ -z "$all_new" ]] && { echo "You're all caught up — no new episodes."; exit 0; }
 
-  if ollama_available; then
-    echo "Asking Llama 3.2 to rank unplayed episodes..." >&2
+  if llm_available; then
+    echo "Asking your local model to rank unplayed episodes..." >&2
     local titles_only; titles_only=$(echo "$all_new" | cut -f1)
     local sys="You are a podcast curator. Given a numbered list of unplayed episode titles, pick the 8 most interesting or substantive ones (skip filler/ad/trailer-sounding titles). Reply with ONLY the exact titles you picked, one per line, copied verbatim from the input, no numbering, no commentary."
     local numbered; numbered=$(nl -ba -w1 -s'. ' <<< "$titles_only")
@@ -1136,7 +1416,7 @@ cmd_recommend_podcast() {
       while IFS= read -r line; do
         line=$(sed -E 's/^[[:space:]]*[-*0-9.)]+[[:space:]]*//' <<<"$line")
         [[ -z "$line" ]] && continue
-        local match; match=$(echo "$all_new" | grep -F "$line" | head -n1)
+        local match; match=$(echo "$all_new" | grep -F "$line" | head -n1 || true)
         [[ -n "$match" ]] && ranked+="$match"$'\n'
       done <<< "$raw"
       [[ -n "$ranked" ]] && all_new="$ranked"
@@ -1159,216 +1439,983 @@ cmd_recommend() {
   esac
 }
 
-# ---------- natural language / mood search (Ollama) ----------
+# ======================================================================
+#  Listening stats, reports & AI insights
+# ======================================================================
 
-cmd_mood() {
-  local desc="${1:-}"
-  [[ -z "$desc" ]] && read -rp "Describe what you want to listen to: " desc
-  [[ -z "$desc" ]] && exit 0
+STATS_PY=''
+read -r -d '' STATS_PY <<'PYEOF' || true
+import sys, os, re, json, shutil, argparse, random
+from collections import Counter
+from datetime import datetime, timedelta
 
-  if ! ollama_available; then
-    echo "⚠ Ollama not reachable at ${OLLAMA_URL}. Falling back to plain search on: $desc"
-    cmd_search "$desc"
-    return
-  fi
+YT_RE = re.compile(r'(?:[?&]v=|youtu\.be/|/shorts/|/embed/)([A-Za-z0-9_-]{11})')
+WEEKDAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+PARTS = [('night', 0, 6), ('morning', 6, 12), ('afternoon', 12, 18), ('evening', 18, 24)]
+SPARK = ' ▁▂▃▄▅▆▇█'
+TAIL_W = 15
 
-  echo "Thinking about: \"$desc\" ..." >&2
-  local sys="You turn a mood or vibe description into good YouTube search queries for music. Reply with ONLY 5 short search queries, one per line, no numbering, no explanation, no quotes."
-  local raw; raw=$(llm_ask "$sys" "$desc" 2>/dev/null) || raw=""
-  local queries; queries=$(echo "$raw" | llm_lines_to_list 5)
-  if [[ -z "$queries" ]]; then
-    echo "Model gave no usable output, falling back to plain search."
-    cmd_search "$desc"
-    return
-  fi
 
-  echo "Searching for:"
-  echo "$queries" | sed 's/^/  • /'
-  local combined=""
-  while IFS= read -r q; do
-    [[ -z "$q" ]] && continue
-    combined+="$(search_and_pick "$q" 6 || true)"$'\n'
-  done <<< "$queries"
-  combined=$(echo "$combined" | grep -v '^\s*$' | awk -F'\t' '!seen[$2]++')
-  [[ -z "$combined" ]] && { echo "No results found."; exit 0; }
+# ---------------------------------------------------------------- loading
+def key_of(url):
+    m = YT_RE.search(url or '')
+    return 'yt:' + m.group(1) if m else (url or '')
 
-  local selections
-  selections=$(echo "$combined" | fzf --multi --delimiter='\t' --with-nth=1,3,4 \
-      --prompt="🎵 mood: $desc (tab to multi-select) > " --height=60% --border --reverse \
-      --preview='echo -e "Title:    \033[1m{1}\033[0m\nChannel:  {3}\nDuration: {4}\nURL:      {2}"' \
-      --preview-window="down:4:wrap:hidden" --bind="?:toggle-preview") || exit 0
-  [[ -z "$selections" ]] && exit 0
 
-  local playlist_file; playlist_file=$(mktemp /tmp/tunes-mood-XXXX.m3u)
-  local count=0
-  while IFS=$'\t' read -r title url channel duration; do
-    [[ -z "$url" ]] && continue
-    local clean; clean=$(clean_title "$title")
-    log_history "$title" "$url"
-    { echo "#EXTINF:-1,${clean}"; echo "$url"; } >> "$playlist_file"
-    count=$((count+1))
-  done <<< "$selections"
+def clean_artist(a):
+    return re.sub(r'\s*-\s*Topic$', '', (a or '').strip(), flags=re.I)
 
-  cleanup_stale_socket
-  local loop_flag="" shuffle_flag=""
-  [[ "${LOOP:-0}" == "1" ]] && loop_flag="--loop-playlist=inf"
-  [[ "${SHUFFLE:-0}" == "1" ]] && shuffle_flag="--shuffle"
-  local script_args; script_args=$(get_mpv_script_args)
 
-  if [[ "${DETACH:-0}" == "1" ]]; then
-    echo "▶ Playing mood queue of ${count} tracks in background"
-    nohup mpv --no-video --input-ipc-server="$MPV_SOCKET" \
-        $script_args $YTDL_ARGS $loop_flag $shuffle_flag "$playlist_file" > "$DATA_DIR/tunes.log" 2>&1 &
-    local pid=$!
-    disown "$pid"
-    desktop_notify "Mood Queue Started" "Playing ${count} tracks" "audio-headphones"
-  else
-    echo "▶ Playing mood queue of ${count} tracks"
-    mpv --no-video --input-ipc-server="$MPV_SOCKET" \
-        $script_args $YTDL_ARGS $loop_flag $shuffle_flag --term-osd-bar "$playlist_file"
-    rm -f "$playlist_file"
-  fi
+def load(path, thresh):
+    rows = []
+    try:
+        f = open(path, encoding='utf-8', errors='replace')
+    except OSError:
+        return rows
+    with f:
+        for line in f:
+            p = line.rstrip('\n').split('\t')
+            if len(p) < 7:
+                continue
+            try:
+                ts, listened, dur = int(float(p[0])), float(p[2]), float(p[3] or 0)
+            except ValueError:
+                continue
+            kind = p[1] or 'music'
+            need = 60.0 if kind == 'podcast' else float(thresh)
+            if dur > 0:
+                need = min(need, dur * 0.5)
+            rows.append(dict(ts=ts, kind=kind, listened=listened, dur=dur, title=p[4],
+                             artist=clean_artist(p[5]), url=p[6], key=key_of(p[6]),
+                             counted=listened >= need))
+    rows.sort(key=lambda r: r['ts'])
+    return rows
+
+
+# ---------------------------------------------------------------- periods
+def parse_period(s, now):
+    """-> (start_ts|None, end_ts, label)"""
+    s = (s or 'week').strip().lower()
+    end = int(now.timestamp())
+    if s in ('all', 'alltime', 'all-time', 'ever'):
+        return None, end, 'all time'
+    if s == 'today':
+        mid = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return int(mid.timestamp()), end, 'today'
+    if s == 'yesterday':
+        mid = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return int((mid - timedelta(days=1)).timestamp()), int(mid.timestamp()), 'yesterday'
+    named = {'week': 7, 'weekly': 7, 'month': 30, 'monthly': 30, 'year': 365, 'yearly': 365}
+    days = named.get(s)
+    if days is None:
+        m = re.fullmatch(r'(\d+)\s*([dwmy]?)', s)
+        if m:
+            mult = {'': 1, 'd': 1, 'w': 7, 'm': 30, 'y': 365}[m.group(2)]
+            days = int(m.group(1)) * mult
+    if days:
+        return end - days * 86400, end, 'last %d days' % days if days != 7 else 'last 7 days'
+    if re.fullmatch(r'\d{4}-\d{2}-\d{2}', s):
+        d = datetime.strptime(s, '%Y-%m-%d')
+        return int(d.timestamp()), end, 'since ' + s
+    if re.fullmatch(r'\d{4}-\d{2}', s):
+        d = datetime.strptime(s, '%Y-%m')
+        nxt = (d.replace(day=28) + timedelta(days=4)).replace(day=1)
+        return int(d.timestamp()), int(nxt.timestamp()), d.strftime('%B %Y')
+    raise SystemExit("Unknown period '%s'. Try: today, week, month, year, all, 14d, 8w, 2026-10-01, 2026-09" % s)
+
+
+# ---------------------------------------------------------------- analysis
+def streaks(dates, today):
+    if not dates:
+        return 0, 0
+    ds = sorted(dates)
+    longest = run = 1
+    for a, b in zip(ds, ds[1:]):
+        run = run + 1 if (b - a).days == 1 else 1
+        longest = max(longest, run)
+    cur, d = 0, today
+    if d not in dates:
+        d = today - timedelta(days=1)
+    while d in dates:
+        cur += 1
+        d -= timedelta(days=1)
+    return cur, longest
+
+
+def window(rows, start, end):
+    return [r for r in rows if (start is None or r['ts'] >= start) and r['ts'] < end]
+
+
+def basics(sel):
+    played = [r for r in sel if r['counted']]
+    return dict(plays=len(played), skips=len(sel) - len(played),
+                secs=sum(r['listened'] for r in sel),
+                unique_tracks=len({r['key'] for r in played}))
+
+
+def analyze(rows, start, end, label, now):
+    music = [r for r in rows if r['kind'] != 'podcast']
+    pods = [r for r in rows if r['kind'] == 'podcast']
+    first_seen = {}
+    for r in music:
+        if r['counted'] and r['key'] not in first_seen:
+            first_seen[r['key']] = r['ts']
+
+    sel = window(music, start, end)
+    played = [r for r in sel if r['counted']]
+    tracks = {}
+    for r in sel:  # chronological, so the newest title/url wins
+        t = tracks.setdefault(r['key'], dict(key=r['key'], plays=0, skips=0, secs=0.0, last=0,
+                                             title='', artist='', url=''))
+        t.update(title=r['title'] or t['title'], artist=r['artist'] or t['artist'], url=r['url'], last=r['ts'])
+        t['secs'] += r['listened']
+        t['plays' if r['counted'] else 'skips'] += 1
+    ranked = sorted((t for t in tracks.values() if t['plays']),
+                    key=lambda t: (-t['plays'], -t['secs'], -t['last']))
+    skipped = sorted((t for t in tracks.values() if t['skips'] >= 2 and t['skips'] > t['plays']),
+                     key=lambda t: (-t['skips'], t['title']))
+
+    artists = {}
+    for r in played:
+        if not r['artist']:
+            continue
+        a = artists.setdefault(r['artist'], dict(artist=r['artist'], plays=0, secs=0.0, keys=set()))
+        a['plays'] += 1
+        a['secs'] += r['listened']
+        a['keys'].add(r['key'])
+    top_artists = sorted(artists.values(), key=lambda a: (-a['plays'], -a['secs']))
+    for a in top_artists:
+        a['tracks'] = len(a.pop('keys'))
+
+    weekday, hours = [0] * 7, [0] * 24
+    day_counts = Counter()
+    for r in played:
+        dt = datetime.fromtimestamp(r['ts'])
+        weekday[dt.weekday()] += 1
+        hours[dt.hour] += 1
+        day_counts[dt.date()] += 1
+    parts = {name: sum(hours[a:b]) for name, a, b in PARTS}
+
+    all_days = {datetime.fromtimestamp(r['ts']).date() for r in music if r['counted']}
+    cur_streak, best_streak = streaks(all_days, now.date())
+
+    new_keys = {k for k, ts in first_seen.items()
+                if (start is None or ts >= start) and ts < end}
+    played_keys = {r['key'] for r in played}
+    new_top = [t for t in ranked if t['key'] in new_keys][:3]
+
+    prev = None
+    if start is not None:
+        span = end - start
+        prev = basics(window(music, start - span, start))
+
+    pod_sel = window(pods, start, end)
+    d = dict(label=label, start=start, end=end, **basics(sel))
+    d.update(
+        starts=len(sel),
+        skip_rate=(len(sel) - len(played)) / len(sel) if sel else 0.0,
+        unique_artists=len(artists),
+        top_tracks=ranked, top_artists=top_artists, most_skipped=skipped[:3],
+        weekday=weekday, hours=hours, parts=parts,
+        busiest_day=(max(day_counts.items(), key=lambda kv: (kv[1], kv[0])) if day_counts else None),
+        active_days=len(day_counts),
+        streak_current=cur_streak, streak_longest=best_streak,
+        new_tracks=len(new_keys & played_keys), familiar_tracks=len(played_keys - new_keys),
+        new_top=new_top, prev=prev,
+        podcast_secs=sum(r['listened'] for r in pod_sel),
+        podcast_episodes=len({r['key'] for r in pod_sel if r['counted']}),
+        first_play=(datetime.fromtimestamp(music[0]['ts']).date() if music else None),
+    )
+    return d
+
+
+# ---------------------------------------------------------------- formatting
+def fmt_dur(s):
+    s = int(round(s))
+    h, rem = divmod(s, 3600)
+    m = rem // 60
+    if h:
+        return '%dh %02dm' % (h, m)
+    return '%dm' % m if m else '%ds' % s
+
+
+def fmt_clock(s):
+    m, sec = divmod(int(s), 60)
+    return '%d:%02d' % (m, sec)
+
+
+def n(count, word):
+    return '%d %s%s' % (count, word, '' if count == 1 else 's')
+
+
+def pct(a, b):
+    if not b:
+        return 'new' if a else '—'
+    v = round((a - b) / b * 100)
+    return '%+d%%' % v
+
+
+def bar(v, vmax, width=18):
+    if not vmax or not v:
+        return ''
+    return '█' * max(1, round(v / vmax * width))
+
+
+def spark(values):
+    vmax = max(values) if values else 0
+    if not vmax:
+        return SPARK[0] * len(values)
+    return ''.join(SPARK[max(1, round(v / vmax * 8))] if v else SPARK[0] for v in values)
+
+
+def clip(s, n):
+    return s if len(s) <= n else s[:max(1, n - 1)] + '…'
+
+
+def span_text(d):
+    if d['start'] is None:
+        return ''
+    a = datetime.fromtimestamp(d['start'])
+    b = datetime.fromtimestamp(d['end'])
+    return '%s → %s' % (a.strftime('%b %d'), b.strftime('%b %d, %Y'))
+
+
+class Out:
+    def __init__(self, color):
+        self.color, self.lines = color, []
+
+    def c(self, code, s):
+        return '\033[%sm%s\033[0m' % (code, s) if self.color else s
+
+    def add(self, s=''):
+        self.lines.append(s)
+
+    def text(self):
+        return '\n'.join(self.lines)
+
+
+def track_line(o, i, t, width):
+    name = t['title'] + (' — ' + t['artist'] if t['artist'] and t['artist'].lower() not in t['title'].lower() else '')
+    tail = ('×%d · %s' % (t['plays'], fmt_dur(t['secs']))).rjust(TAIL_W)
+    room = max(20, width - TAIL_W - 8)
+    return ' %s %s  %s' % (o.c('2', '%2d.' % i), clip(name, room).ljust(room), o.c('36', tail))
+
+
+def render(d, color, mode):
+    o, W = Out(color), min(shutil.get_terminal_size((90, 24)).columns, 100)
+    title = 'Tunes Weekly Report' if (mode == 'report' and d['label'] == 'last 7 days') else \
+            ('Tunes Listening Report' if mode == 'report' else 'Tunes Listening Statistics')
+    o.add(o.c('1', '🎧 ' + title) + '  ' + o.c('2', d['label'] + (('  ·  ' + span_text(d)) if span_text(d) else '')))
+    o.add('')
+    if not d['starts'] and not d['podcast_secs']:
+        o.add('  No listening logged in this period yet.')
+        o.add('  Plays are tracked automatically while you listen with tunes (a play counts after %ss).' %
+              os.environ.get('TUNES_THRESH', '30'))
+        return o.text()
+
+    o.add(' ▸ %s plays · %s listened · %d unique tracks · %d artists' % (
+        o.c('1', '{:,}'.format(d['plays'])), o.c('1', fmt_dur(d['secs'])), d['unique_tracks'], d['unique_artists']))
+    if d['starts']:
+        o.add(' ▸ Skip rate %d%% (%d of %d starts)' % (round(d['skip_rate'] * 100), d['skips'], d['starts']))
+    if d['prev'] is not None and (d['prev']['plays'] or d['prev']['secs']):
+        o.add(' ▸ vs previous period: plays %s · time %s' % (
+            o.c('32', pct(d['plays'], d['prev']['plays'])), o.c('32', pct(d['secs'], d['prev']['secs']))))
+    if d['streak_current'] or d['streak_longest']:
+        o.add(' ▸ Streak: %d day%s (best: %d)' % (d['streak_current'], '' if d['streak_current'] == 1 else 's', d['streak_longest']))
+    if mode == 'stats' and d['first_play']:
+        o.add(' ▸ Listening since %s' % d['first_play'])
+    o.add('')
+
+    n_tracks = 10 if mode == 'stats' else 8
+    if d['top_tracks']:
+        o.add(o.c('1;33', '🔥 Most played'))
+        for i, t in enumerate(d['top_tracks'][:n_tracks], 1):
+            o.add(track_line(o, i, t, W))
+        o.add('')
+    if d['top_artists']:
+        o.add(o.c('1;35', '🎤 Top artists'))
+        for i, a in enumerate(d['top_artists'][:5], 1):
+            tail = ('×%d · %d track%s' % (a['plays'], a['tracks'], '' if a['tracks'] == 1 else 's')).rjust(TAIL_W)
+            room = max(20, W - TAIL_W - 8)
+            o.add(' %s %s  %s' % (o.c('2', '%2d.' % i), clip(a['artist'], room).ljust(room), o.c('36', tail)))
+        o.add('')
+
+    if mode == 'report':
+        if d['plays']:
+            vmax = max(d['weekday'])
+            o.add(o.c('1;34', '📅 By weekday'))
+            for name, v in zip(WEEKDAYS, d['weekday']):
+                o.add('  %s %s %s' % (name, o.c('34', bar(v, vmax).ljust(18)), v if v else ''))
+            o.add('')
+            peak = max(range(24), key=lambda h: (d['hours'][h], -h))
+            top_part = max(d['parts'].items(), key=lambda kv: kv[1])[0]
+            o.add(o.c('1;34', '🕒 Time of day'))
+            o.add('  0h %s 23h' % spark(d['hours']))
+            o.add('  Mostly %s listening · peak hour %02d:00 (%d plays)' % (top_part, peak, d['hours'][peak]))
+            if d['busiest_day']:
+                o.add('  Busiest day: %s (%d plays)' % (d['busiest_day'][0].strftime('%a %b %d'), d['busiest_day'][1]))
+            o.add('')
+            o.add(o.c('1;32', '✨ Discovery'))
+            o.add('  %d new track%s this period · %d familiar favourites' % (
+                d['new_tracks'], '' if d['new_tracks'] == 1 else 's', d['familiar_tracks']))
+            for t in d['new_top']:
+                o.add('    + %s' % clip(t['title'] + (' — ' + t['artist'] if t['artist'] else ''), W - 8))
+            o.add('')
+        if d['most_skipped']:
+            o.add(o.c('1;31', '⏭ Often skipped'))
+            for t in d['most_skipped']:
+                o.add('  %s  (%d skips)' % (clip(t['title'], W - 20), t['skips']))
+            o.add('')
+    if d['podcast_secs'] >= 60:
+        o.add(o.c('1', '🎙 Podcasts') + ': %s across %d episode%s' % (
+            fmt_dur(d['podcast_secs']), d['podcast_episodes'], '' if d['podcast_episodes'] == 1 else 's'))
+        o.add('')
+    return o.text().rstrip('\n')
+
+
+def context(d):
+    """Compact plain-text digest for an LLM: numbers only, nothing to invent."""
+    L = []
+    L.append('Period: %s%s' % (d['label'], (' (%s)' % span_text(d)) if span_text(d) else ''))
+    pv = d['prev']
+    L.append('Plays: %d%s' % (d['plays'], (' (previous period: %d, change %s)' % (pv['plays'], pct(d['plays'], pv['plays']))) if pv else ''))
+    L.append('Listening time: %s%s' % (fmt_dur(d['secs']), (' (previous: %s)' % fmt_dur(pv['secs'])) if pv else ''))
+    L.append('Unique tracks: %d; unique artists: %d' % (d['unique_tracks'], d['unique_artists']))
+    L.append('Skip rate: %d%% (%d skips of %d starts)' % (round(d['skip_rate'] * 100), d['skips'], d['starts']))
+    if d['top_tracks']:
+        L.append('Top tracks: ' + '; '.join('%d. "%s"%s - %s' % (
+            i, t['title'], (' by ' + t['artist']) if t['artist'] else '', n(t['plays'], 'play'))
+            for i, t in enumerate(d['top_tracks'][:10], 1)))
+    if d['top_artists']:
+        L.append('Top artists: ' + '; '.join('%s (%s, %s)' % (a['artist'], n(a['plays'], 'play'), n(a['tracks'], 'track'))
+                                              for a in d['top_artists'][:6]))
+    L.append('Plays by weekday: ' + ', '.join('%s %d' % kv for kv in zip(WEEKDAYS, d['weekday'])))
+    L.append('Plays by time of day: ' + ', '.join('%s %d' % kv for kv in d['parts'].items()))
+    if d['busiest_day']:
+        L.append('Busiest day: %s with %s' % (d['busiest_day'][0], n(d['busiest_day'][1], 'play')))
+    L.append('New tracks first heard this period: %d; familiar tracks replayed: %d' % (d['new_tracks'], d['familiar_tracks']))
+    if d['new_top']:
+        L.append('Most played new tracks: ' + '; '.join('"%s"' % t['title'] for t in d['new_top']))
+    if d['most_skipped']:
+        L.append('Often skipped: ' + '; '.join('"%s" (%s)' % (t['title'], n(t['skips'], 'skip')) for t in d['most_skipped']))
+    L.append('Current listening streak: %s (best ever: %d)' % (n(d['streak_current'], 'day'), d['streak_longest']))
+    if d['podcast_secs'] >= 60:
+        L.append('Podcast time: %s over %s' % (fmt_dur(d['podcast_secs']), n(d['podcast_episodes'], 'episode')))
+    return '\n'.join(L)
+
+
+def jsonable(d):
+    def conv(x):
+        if isinstance(x, (datetime,)) or hasattr(x, 'isoformat'):
+            return x.isoformat()
+        if isinstance(x, set):
+            return sorted(x)
+        return str(x)
+    return json.dumps(d, default=conv, ensure_ascii=False, indent=2)
+
+
+# ---------------------------------------------------------------- main
+def main():
+    ap = argparse.ArgumentParser(prog='tunes-stats')
+    ap.add_argument('mode', choices=['stats', 'report', 'top', 'context', 'json', 'count'])
+    ap.add_argument('plays_file')
+    ap.add_argument('--period', default=None)
+    ap.add_argument('--limit', type=int, default=100)
+    ap.add_argument('--thresh', type=float, default=float(os.environ.get('TUNES_THRESH', '30')))
+    ap.add_argument('--color', action='store_true')
+    a = ap.parse_args()
+
+    now = datetime.now()
+    default_period = 'all' if a.mode in ('stats', 'top') else 'week'
+    start, end, label = parse_period(a.period or default_period, now)
+    rows = load(a.plays_file, a.thresh)
+    d = analyze(rows, start, end, label, now)
+
+    if a.mode == 'count':
+        print(d['plays'])
+    elif a.mode == 'top':
+        for t in d['top_tracks'][:a.limit]:
+            print('\t'.join([t['title'], t['url'], t['artist'], '×%d · %s' % (t['plays'], fmt_clock(t['secs']))]))
+    elif a.mode == 'context':
+        print(context(d))
+    elif a.mode == 'json':
+        print(jsonable(d))
+    else:
+        print(render(d, a.color, a.mode))
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        os._exit(0)
+PYEOF
+
+# stats_engine <stats|report|top|context|json|count> [--period P] [--limit N]
+stats_engine() {
+  local mode="$1"; shift
+  local color=()
+  if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then color=(--color); fi
+  TUNES_THRESH="$PLAY_THRESHOLD" python3 -c "$STATS_PY" "$mode" "$PLAYS_FILE" "${color[@]}" "$@"
 }
 
-# ---------- listening statistics ----------
+mark_report() { date +%s > "$LAST_REPORT_FILE" 2>/dev/null || true; }
+
+# One-line nudge (used by the home menu) when a week has passed since the last report.
+report_reminder() {
+  [[ "$REPORT_REMINDER" == "off" ]] && return 0
+  local last=0 now n
+  now=$(date +%s)
+  [[ -f "$LAST_REPORT_FILE" ]] && last=$(cat "$LAST_REPORT_FILE" 2>/dev/null || echo 0)
+  [[ "$last" =~ ^[0-9]+$ ]] || last=0
+  if ((now - last >= 7 * 86400)); then
+    n=$(stats_engine count --period week 2>/dev/null || echo 0)
+    if [[ "$n" =~ ^[0-9]+$ ]] && ((n > 0)); then
+      echo "📰 Your weekly report is ready ($n plays this week) — open 'Listening report'"
+    fi
+  fi
+  return 0
+}
 
 cmd_stats() {
-  echo "📊 Tunes Listening Statistics"
-  echo "=============================="
-  local track_count pod_count fav_count feed_count
-  track_count=$(wc -l < "$HISTORY_FILE" 2>/dev/null | tr -d ' ' || echo "0")
-  pod_count=$(wc -l < "$POD_HISTORY_FILE" 2>/dev/null | tr -d ' ' || echo "0")
-  fav_count=$(wc -l < "$FAVORITES_FILE" 2>/dev/null | tr -d ' ' || echo "0")
-  feed_count=$(wc -l < "$FEEDS_FILE" 2>/dev/null | tr -d ' ' || echo "0")
+  local period="all" arg json=0
+  for arg in "$@"; do
+    case "$arg" in
+      --json) json=1 ;;
+      -*) echo "Usage: tunes stats [today|week|month|year|all|<N>d|YYYY-MM-DD] [--json]" >&2; exit 1 ;;
+      *) period="$arg" ;;
+    esac
+  done
+  if ((json)); then stats_engine json --period "$period"; return 0; fi
+  stats_engine stats --period "$period"
+  local favs feeds pls
+  favs=$(grep -c . "$FAVORITES_FILE" 2>/dev/null || true)
+  feeds=$(grep -c . "$FEEDS_FILE" 2>/dev/null || true)
+  pls=$(find "$PLAYLISTS_DIR" -maxdepth 1 -name '*.tsv' 2>/dev/null | grep -c . || true)
+  echo " ▸ Library: ★ ${favs:-0} favourites · 📂 ${pls:-0} playlists · 🎙 ${feeds:-0} podcast feeds"
+}
 
-  echo "  • Total Music Plays:      $track_count"
-  echo "  • Total Podcast Plays:    $pod_count"
-  echo "  • Favorite Tracks:        $fav_count"
-  echo "  • Subscribed Feeds:       $feed_count"
-  echo ""
+REPORT_SYS="You write short, friendly listening reports for a terminal music player, based on a data digest. Use ONLY facts and numbers that appear in the digest — never invent songs, artists, genres or numbers. Write 4 to 6 sentences of plain prose (no markdown, no bullet points, no headings): name the top track and artist, point out one pattern (time of day or weekday), mention the change versus the previous period if one is given, and end with one concrete suggestion for what to explore next."
 
-  if [[ -s "$HISTORY_FILE" ]]; then
-    echo "🔥 Top Repeated Tracks:"
-    cut -f1 "$HISTORY_FILE" | sort | uniq -c | sort -rn | head -5 | awk '{$1="  " $1 "x"; print}' || true
-    echo ""
-    echo "🏷 Top Music Keywords / Artists:"
-    cut -f1 "$HISTORY_FILE" | top_words 5 | sed 's/^/    • /' || true
+ASK_SYS="You are a friendly analyst of the user's music listening habits. You are given a data digest for several periods. Answer the question using ONLY the data provided. If the data cannot answer it, say so plainly. Be concise (a short paragraph or a few lines), do not invent songs, artists or numbers, and do not use markdown."
+
+wrap_text() { fold -s -w "${1:-80}"; }
+
+# tunes report [period] [--ai] [--save] [--notify] [--json]
+cmd_report() {
+  local period="week" ai=0 save=0 notify=0 json=0
+  while (($#)); do
+    case "$1" in
+      --ai) ai=1 ;;
+      --save) save=1 ;;
+      --notify) notify=1 ;;
+      --json) json=1 ;;
+      -h|--help)
+        cat <<'USAGE'
+Usage: tunes report [period] [--ai] [--save] [--notify] [--json]
+  period   today | yesterday | week (default) | month | year | all | <N>d | <N>w | YYYY-MM-DD | YYYY-MM
+  --ai     add a short written take from your local LLM (see: tunes ai setup)
+  --save   also write the report to ~/.local/share/tunes/reports/
+  --notify send a desktop notification with the headline numbers
+  --json   print the raw numbers as JSON
+USAGE
+        return 0 ;;
+      -*) echo "Unknown option: $1 (try: tunes report --help)" >&2; exit 1 ;;
+      *) period="$1" ;;
+    esac
+    shift
+  done
+
+  if ((json)); then stats_engine json --period "$period"; mark_report; return 0; fi
+
+  stats_engine report --period "$period"
+  mark_report
+
+  local plays
+  plays=$(stats_engine count --period "$period")
+  local ai_text=""
+  if ((ai)); then
+    echo
+    if ((plays == 0)); then
+      echo "🤖 Nothing to analyse yet — listen to a few tracks first."
+    else
+      echo "🤖 Asking ${LLM_MODEL} for its take ..." >&2
+      if ai_text=$(llm_ask "$REPORT_SYS" "$(stats_engine context --period "$period")"); then
+        echo "🤖 AI take ($LLM_MODEL)"
+        printf '%s\n' "$ai_text" | wrap_text 80 | sed 's/^/   /'
+      else
+        ai_text=""
+        echo "   (AI take unavailable — connect a local model with: tunes ai setup)"
+      fi
+    fi
+  fi
+
+  if ((save)); then
+    mkdir -p "$REPORTS_DIR"
+    local out
+    out="$REPORTS_DIR/report-$(date +%F)-${period//[^A-Za-z0-9_-]/_}.txt"
+    {
+      NO_COLOR=1 stats_engine report --period "$period" | cat
+      if [[ -n "$ai_text" ]]; then
+        printf '\nAI take (%s)\n' "$LLM_MODEL"
+        printf '%s\n' "$ai_text" | wrap_text 80 | sed 's/^/   /'
+      fi
+    } > "$out"
+    echo; echo "💾 Saved: $out"
+  fi
+
+  if ((notify)); then
+    local top
+    top=$(stats_engine top --period "$period" --limit 1 | cut -f1 || true)
+    desktop_notify "Tunes report ($period)" "${plays} plays${top:+ · top track: $top}" "audio-headphones"
+  fi
+  return 0
+}
+
+# tunes ask "which artist did I listen to most on weekends?"
+cmd_ask() {
+  local q="$*"
+  [[ -z "$q" ]] && read -rp "Ask about your listening: " q
+  [[ -z "$q" ]] && exit 0
+  local total
+  total=$(stats_engine count --period all)
+  if ((total == 0)); then echo "No listening data yet — play some tracks first."; exit 0; fi
+  local ctx
+  ctx="=== Last 7 days ===
+$(stats_engine context --period week)
+
+=== Last 30 days ===
+$(stats_engine context --period month)
+
+=== All time ===
+$(stats_engine context --period all)"
+  echo "Thinking ..." >&2
+  local ans
+  ans=$(llm_ask "$ASK_SYS" "$ctx"$'\n\n'"Question: $q") || exit 1
+  printf '\n%s\n' "$ans" | wrap_text 80
+}
+
+# tunes top [period]  — browse & play your most-played tracks
+cmd_top() {
+  local period="${1:-all}" rows selections
+  rows=$(stats_engine top --period "$period" --limit 100)
+  if [[ -z "$rows" ]]; then echo "No plays logged for '$period' yet — go listen to something!"; exit 0; fi
+  selections=$(printf '%s\n' "$rows" | fzf --multi --delimiter='\t' --with-nth=1,3,4 \
+      --prompt="🔥 most played ($period) > " --header="TAB: select several · ENTER: play · ?: details" \
+      --height=70% --border --reverse \
+      --preview='echo -e "Title:   \033[1m{1}\033[0m\nArtist:  {3}\nPlays:   {4}\nURL:     {2}"' \
+      --preview-window="down:4:wrap:hidden" --bind="?:toggle-preview") || exit 0
+  [[ -z "$selections" ]] && exit 0
+  play_queue "Most played ($period)" "$selections"
+}
+
+shuffle_lines() { if command -v shuf >/dev/null 2>&1; then shuf; else sort -R; fi; }
+
+# tunes mix [N]  — a personal shuffle built from your most-played tracks + favourites
+cmd_mix() {
+  local n="${1:-25}"
+  [[ "$n" =~ ^[0-9]+$ ]] && ((n > 0)) || { echo "Usage: tunes mix [number-of-tracks]"; exit 1; }
+  local pool picks
+  pool=$({ stats_engine top --period all --limit 60 | cut -f1,2; cat "$FAVORITES_FILE" 2>/dev/null || true; } \
+         | awk -F'\t' 'NF >= 2 && !seen[$2]++')
+  if [[ -z "$pool" ]]; then echo "Nothing to mix yet — listen to a few tracks or add favourites first."; exit 0; fi
+  picks=$(printf '%s\n' "$pool" | shuffle_lines | awk -v n="$n" 'NR <= n')
+  play_queue "Your mix" "$picks"
+}
+
+# tunes add [query]  — append tracks to the queue that is playing right now
+cmd_add() {
+  local query="${1:-}"
+  if ! mpv_ipc '["get_property","pid"]' 0 >/dev/null 2>&1; then
+    echo "Nothing is playing — starting a new session instead."
+    cmd_search "$query"; return 0
+  fi
+  [[ -z "$query" ]] && read -rp "Add to queue — search: " query
+  [[ -z "$query" ]] && exit 0
+  local selections title url rest
+  selections=$(search_and_pick "$query" | pick_multi "➕ add to queue (tab for several) > ") || exit 0
+  while IFS=$'\t' read -r title url rest; do
+    [[ -z "$url" ]] && continue
+    log_history "$title" "$url"
+    if mpv_ipc "$(jq -cn --arg u "$url" '["loadfile",$u,"append-play"]')" 0; then
+      echo "➕ Queued: $title"
+    else
+      echo "✗ Could not queue: $title"
+    fi
+  done <<< "$selections"
+}
+
+# ======================================================================
+#  AI connection, config, doctor
+# ======================================================================
+
+llm_models() {
+  local base; base=$(llm_base)
+  local args=(-sf --max-time 5)
+  [[ -n "$LLM_API_KEY" ]] && args+=(-H "Authorization: Bearer $LLM_API_KEY")
+  if [[ "$LLM_BACKEND" == openai ]]; then
+    curl "${args[@]}" "$base/v1/models" 2>/dev/null \
+      | python3 -c 'import sys,json; [print(m.get("id","")) for m in json.load(sys.stdin).get("data",[])]' 2>/dev/null || true
+  else
+    curl "${args[@]}" "$base/api/tags" 2>/dev/null \
+      | python3 -c 'import sys,json; [print(m.get("name","")) for m in json.load(sys.stdin).get("models",[])]' 2>/dev/null || true
   fi
 }
 
-cmd_completion() {
-  cat <<'EOF'
-# Bash completion for tunes
-_tunes_completions() {
-  local cur prev subcmds ctl_cmds pl_cmds pod_cmds rec_cmds
-  cur="${COMP_WORDS[COMP_CWORD]}"
-  prev="${COMP_WORDS[COMP_CWORD-1]}"
+ai_test() {
+  echo "Backend: $LLM_BACKEND   URL: $LLM_URL   Model: $LLM_MODEL"
+  if ! llm_available; then
+    echo "✗ Server not reachable."
+    echo "  Start it (Ollama: 'ollama serve'), or point tunes at it:  tunes ai setup"
+    return 1
+  fi
+  echo "✓ Server reachable"
+  local models; models=$(llm_models)
+  if [[ -n "$models" ]]; then
+    if grep -qxF "$LLM_MODEL" <<<"$models"; then
+      echo "✓ Model '$LLM_MODEL' is available"
+    else
+      echo "✗ Model '$LLM_MODEL' not found. Available: $(tr '\n' ' ' <<<"$models")"
+      [[ "$LLM_BACKEND" == ollama ]] && echo "  Install it with: ollama pull $LLM_MODEL"
+      echo "  Or choose another:  tunes config set LLM_MODEL <name>"
+      return 1
+    fi
+  fi
+  echo "… sending a tiny test prompt"
+  local t0 t1 out
+  t0=$(date +%s)
+  if out=$(llm_ask "You are a connectivity test." "Reply with the single word: ok"); then
+    t1=$(date +%s)
+    echo "✓ Model replied in $((t1 - t0))s: ${out:0:60}"
+  else
+    echo "✗ The model did not answer (see message above)."; return 1
+  fi
+}
 
-  subcmds="search bg play video vlc queue history fav-add favorites fav-remove download lyrics ctl status np notify pod pod-add pod-add-url pod-feeds pod-history pod-download pod-remove recommend mood playlist stats help"
-  ctl_cmds="pause play stop next prev vol vol-up vol-down mute seek speed loop-toggle loop-on loop-off status info"
-  pl_cmds="list create add play view delete"
-  pod_cmds="play add add-url feeds history download remove"
-  rec_cmds="music podcast"
+ai_setup() {
+  echo "Connect a local LLM (used for: report --ai, ask, mood, recommend)"
+  echo "  1) ollama   — Ollama, default http://localhost:11434"
+  echo "  2) openai   — any OpenAI-compatible server (llama.cpp, LM Studio, vLLM, …)"
+  local choice backend url model key
+  read -rp "Backend [1/2] (current: $LLM_BACKEND): " choice
+  case "$choice" in
+    1|ollama) backend=ollama ;;
+    2|openai) backend=openai ;;
+    "") backend="$LLM_BACKEND" ;;
+    *) echo "Please answer 1 or 2."; return 1 ;;
+  esac
+  local default_url="http://localhost:11434"
+  [[ "$backend" == openai ]] && default_url="http://localhost:8080"
+  [[ "$backend" == "$LLM_BACKEND" ]] && default_url="$LLM_URL"
+  read -rp "Server URL [$default_url]: " url; url="${url:-$default_url}"
+  config_set LLM_BACKEND "$backend"; config_set LLM_URL "$url"
+  LLM_BACKEND="$backend"; LLM_URL="$url"
+  if [[ "$backend" == openai ]]; then
+    read -rp "API key (leave empty if none): " key
+    [[ -n "$key" ]] && config_set LLM_API_KEY "$key" && LLM_API_KEY="$key"
+  fi
+  if llm_available; then
+    local models; models=$(llm_models)
+    [[ -n "$models" ]] && { echo "Models on this server:"; sed 's/^/  • /' <<<"$models"; }
+  fi
+  read -rp "Model name [$LLM_MODEL]: " model; model="${model:-$LLM_MODEL}"
+  config_set LLM_MODEL "$model"; LLM_MODEL="$model"
+  echo; ai_test || true
+}
 
-  case "$prev" in
-    tunes)
-      COMPREPLY=( $(compgen -W "$subcmds" -- "$cur") )
-      return 0
-      ;;
-    ctl)
-      COMPREPLY=( $(compgen -W "$ctl_cmds" -- "$cur") )
-      return 0
-      ;;
-    playlist)
-      COMPREPLY=( $(compgen -W "$pl_cmds" -- "$cur") )
-      return 0
-      ;;
-    pod)
-      COMPREPLY=( $(compgen -W "$pod_cmds" -- "$cur") )
-      return 0
-      ;;
-    recommend)
-      COMPREPLY=( $(compgen -W "$rec_cmds" -- "$cur") )
-      return 0
-      ;;
+cmd_ai() {
+  require python3 curl
+  case "${1:-test}" in
+    test) ai_test ;;
+    setup|connect) ai_setup ;;
+    models) llm_available && llm_models || { echo "Server not reachable at $LLM_URL"; return 1; } ;;
+    *) echo "Usage: tunes ai {test|setup|models}"; return 1 ;;
   esac
 }
+
+config_set() {
+  local key="$1" val="$2"
+  if ! is_config_key "$key"; then
+    echo "Unknown setting '$key'. Valid settings: ${CONFIG_KEYS[*]}" >&2; return 1
+  fi
+  case "$key" in
+    LLM_BACKEND) [[ "$val" =~ ^(ollama|openai)$ ]] || { echo "LLM_BACKEND must be 'ollama' or 'openai' (any OpenAI-compatible server)" >&2; return 1; } ;;
+    LLM_TIMEOUT|PLAY_THRESHOLD) [[ "$val" =~ ^[0-9]+$ ]] && ((10#$val > 0)) || { echo "$key must be a positive whole number" >&2; return 1; } ;;
+    DEFAULT_VOLUME) [[ -z "$val" || "$val" =~ ^[0-9]+$ ]] || { echo "DEFAULT_VOLUME must be a number (e.g. 70) or empty" >&2; return 1; } ;;
+    REPORT_REMINDER) [[ "$val" =~ ^(on|off)$ ]] || { echo "REPORT_REMINDER must be 'on' or 'off'" >&2; return 1; } ;;
+  esac
+  mkdir -p "$(dirname "$CONFIG_FILE")"
+  touch "$CONFIG_FILE"; chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+  { grep -v -E "^[[:space:]]*${key}=" "$CONFIG_FILE" 2>/dev/null || true; printf '%s=%s\n' "$key" "$val"; } > "$CONFIG_FILE.tmp"
+  mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"; chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+}
+
+config_unset() {
+  is_config_key "$1" || { echo "Unknown setting '$1'" >&2; return 1; }
+  [[ -f "$CONFIG_FILE" ]] || return 0
+  { grep -v -E "^[[:space:]]*${1}=" "$CONFIG_FILE" 2>/dev/null || true; } > "$CONFIG_FILE.tmp"
+  mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+}
+
+cmd_config() {
+  local sub="${1:-show}"; shift || true
+  case "$sub" in
+    show|"")
+      echo "Config file: $CONFIG_FILE$([[ -f "$CONFIG_FILE" ]] || echo '  (not created yet — defaults in use)')"
+      local k v o note
+      for k in "${CONFIG_KEYS[@]}"; do
+        v="${!k:-}"; note=""
+        [[ "$k" == LLM_API_KEY && -n "$v" ]] && v="********"
+        for o in "${ENV_OVERRIDES[@]:-}"; do
+          [[ "$o" == "$k" ]] && note="   (overridden by environment variable)"
+        done
+        printf '  %-16s %s%s\n' "$k" "${v:-<empty>}" "$note"
+      done
+      echo
+      echo "Change with:  tunes config set KEY VALUE     (LLM wizard: tunes ai setup)"
+      ;;
+    path) echo "$CONFIG_FILE" ;;
+    set)
+      [[ $# -ge 1 ]] || { echo "Usage: tunes config set KEY VALUE" >&2; return 1; }
+      config_set "$1" "${2:-}" && echo "✔ $1 saved" ;;
+    unset) config_unset "${1:-}" && echo "✔ ${1:-} reset to default" ;;
+    edit)
+      mkdir -p "$(dirname "$CONFIG_FILE")"; touch "$CONFIG_FILE"
+      "${EDITOR:-${VISUAL:-vi}}" "$CONFIG_FILE" ;;
+    *) echo "Usage: tunes config {show|set KEY VALUE|unset KEY|edit|path}" >&2; return 1 ;;
+  esac
+}
+
+install_hint() {
+  if command -v apt >/dev/null 2>&1; then echo "sudo apt install $*"
+  elif command -v dnf >/dev/null 2>&1; then echo "sudo dnf install $*"
+  elif command -v pacman >/dev/null 2>&1; then echo "sudo pacman -S $*"
+  elif command -v brew >/dev/null 2>&1; then echo "brew install $*"
+  else echo "install: $*"; fi
+}
+
+cmd_doctor() {
+  echo "tunes $TUNES_VERSION — environment check"
+  echo
+  local d bad=0
+  echo "Required:"
+  for d in mpv yt-dlp fzf python3 curl jq; do
+    if command -v "$d" >/dev/null 2>&1; then printf '  ✓ %s\n' "$d"
+    else printf '  ✗ %-8s → %s\n' "$d" "$(install_hint "$d")"; bad=1; fi
+  done
+  echo "Optional:"
+  local pair
+  for pair in "ffmpeg:mp3 downloads" "notify-send:desktop notifications (libnotify)" "playerctl:media keys" \
+              "sptlrx:synced lyrics" "vlc:'tunes vlc'" "shuf:personal mix (falls back to sort -R)"; do
+    d="${pair%%:*}"
+    if command -v "$d" >/dev/null 2>&1; then printf '  ✓ %-12s %s\n' "$d" "${pair#*:}"
+    else printf '  · %-12s %s (not installed)\n' "$d" "${pair#*:}"; fi
+  done
+  echo "Local LLM:"
+  if command -v curl >/dev/null 2>&1 && llm_available; then
+    printf '  ✓ %s at %s (model: %s)\n' "$LLM_BACKEND" "$LLM_URL" "$LLM_MODEL"
+  else
+    printf '  · not reachable (%s at %s) — optional; set up with: tunes ai setup\n' "$LLM_BACKEND" "$LLM_URL"
+  fi
+  echo "Data:"
+  printf '  %s\n' "$DATA_DIR"
+  if [[ -f "$PLAYS_FILE" ]]; then
+    printf '  ✓ play log: %s sessions recorded\n' "$(grep -c . "$PLAYS_FILE" 2>/dev/null || echo 0)"
+  else
+    echo "  · play log: nothing recorded yet (it starts with your next play)"
+  fi
+  return $bad
+}
+
+# ======================================================================
+#  Interactive home menu (run `tunes` with no arguments)
+# ======================================================================
+
+now_playing_line() {
+  local t p
+  t=$(mpv_ipc '["get_property","media-title"]' 1 2>/dev/null) || return 0
+  p=$(mpv_ipc '["get_property","pause"]' 1 2>/dev/null || echo false)
+  if [[ "$p" == "true" ]]; then echo "⏸  $t"; else echo "▶  $t"; fi
+}
+
+menu_items() {
+  printf '%s\t%s\n' \
+    "search"        "🔎  Search & play" \
+    "queue"         "🎚  Build a queue (multi-select)" \
+    "top"           "🔥  Most played" \
+    "mix"           "🎲  My mix (from your favourites & top tracks)" \
+    "favorites"     "★   Favourites" \
+    "history"       "🕒  Recently played" \
+    "playlist play" "📂  Playlists" \
+    "mood"          "🌦  Mood search (AI)" \
+    "recommend"     "✨  Recommendations" \
+    "pod"           "🎙  Podcasts" \
+    "report"        "📰  Listening report" \
+    "report --ai"   "🤖  Listening report + AI take" \
+    "ask"           "💬  Ask AI about my listening" \
+    "stats"         "📊  Stats" \
+    "ctl-menu"      "🎛  Playback controls" \
+    "config"        "⚙   Settings" \
+    "quit"          "✖   Quit"
+}
+
+controls_menu() {
+  local act parts
+  while true; do
+    local np; np=$(now_playing_line || true)
+    act=$(printf '%s\t%s\n' \
+      "pause"       "⏯   Play / pause" \
+      "next"        "⏭   Next track" \
+      "prev"        "⏮   Previous track" \
+      "vol-up"      "🔊  Volume up" \
+      "vol-down"    "🔉  Volume down" \
+      "mute"        "🔇  Mute / unmute" \
+      "seek +15"    "⏩  Forward 15s" \
+      "seek -15"    "⏪  Back 15s" \
+      "loop-toggle" "🔁  Toggle loop" \
+      "queue"       "📜  Show queue" \
+      "stop"        "⏹   Stop" \
+      | fzf --delimiter='\t' --with-nth=2 --prompt="controls > " --header="${np:-Nothing playing}" \
+            --height=50% --border --reverse | cut -f1) || return 0
+    [[ -z "$act" ]] && return 0
+    IFS=' ' read -ra parts <<<"$act"
+    "$SELF" ctl "${parts[@]}" || true
+    if [[ "$act" == "queue" ]]; then read -rp "↵ " _ || true; fi
+  done
+}
+
+cmd_home() {
+  if [[ ! -t 0 || ! -t 1 ]]; then cmd_help; return 0; fi
+  local choice key parts np rem header
+  while true; do
+    np=$(now_playing_line || true)
+    rem=$(report_reminder || true)
+    header="🎵 tunes $TUNES_VERSION"
+    [[ -n "$np" ]] && header+=$'\n'"$np"
+    [[ -n "$rem" ]] && header+=$'\n'"$rem"
+    choice=$(menu_items | fzf --delimiter='\t' --with-nth=2 --prompt="tunes > " --header="$header" \
+              --height=85% --border --reverse) || break
+    key=$(cut -f1 <<<"$choice")
+    case "$key" in
+      quit|"") break ;;
+      ctl-menu) controls_menu ;;
+      *)
+        IFS=' ' read -ra parts <<<"$key"
+        "$SELF" "${parts[@]}" || true
+        case "$key" in
+          report*|ask|stats|config) read -rp "↵ back to menu " _ || true ;;
+        esac
+        ;;
+    esac
+  done
+}
+
+
+cmd_completion() {
+  cat <<'COMPEOF'
+# Bash completion for tunes
+_tunes_completions() {
+  local cur prev prev2 subcmds
+  cur="${COMP_WORDS[COMP_CWORD]}"
+  prev="${COMP_WORDS[COMP_CWORD-1]}"
+  prev2=""; (( COMP_CWORD > 1 )) && prev2="${COMP_WORDS[COMP_CWORD-2]}"
+
+  subcmds="home search bg play video vlc queue add history fav-add favorites fav-remove download lyrics ctl status np notify top mix stats report ask ai config doctor pod pod-add pod-add-url pod-feeds pod-history pod-download pod-remove recommend mood playlist completion version help"
+
+  if [[ "$prev2" == "config" && ( "$prev" == "set" || "$prev" == "unset" ) ]]; then
+    COMPREPLY=( $(compgen -W "LLM_BACKEND LLM_URL LLM_MODEL LLM_API_KEY LLM_TIMEOUT YT_CLIENT PLAY_THRESHOLD REPORT_REMINDER DEFAULT_VOLUME" -- "$cur") ); return 0
+  fi
+  case "$prev" in
+    tunes|-d|-l|-s|--bg|--detach|--loop|--shuffle) COMPREPLY=( $(compgen -W "$subcmds" -- "$cur") ) ;;
+    ctl)       COMPREPLY=( $(compgen -W "pause play stop next prev vol vol-up vol-down mute seek speed loop-toggle loop-on loop-off queue jump status" -- "$cur") ) ;;
+    playlist)  COMPREPLY=( $(compgen -W "list create add play view remove delete" -- "$cur") ) ;;
+    recommend) COMPREPLY=( $(compgen -W "music podcast" -- "$cur") ) ;;
+    stats|top) COMPREPLY=( $(compgen -W "today yesterday week month year all" -- "$cur") ) ;;
+    report)    COMPREPLY=( $(compgen -W "today yesterday week month year all --ai --save --notify --json" -- "$cur") ) ;;
+    config)    COMPREPLY=( $(compgen -W "show set unset edit path" -- "$cur") ) ;;
+    ai)        COMPREPLY=( $(compgen -W "test setup models" -- "$cur") ) ;;
+  esac
+  return 0
+}
 complete -F _tunes_completions tunes
-EOF
+COMPEOF
 }
 
 cmd_help() {
-  cat <<EOF
-tunes — terminal music & podcast player with GNOME integration
+  cat <<HELPEOF
+tunes $TUNES_VERSION — a lightweight terminal music & podcast player
 
-Usage:
+Run  tunes  with no arguments for the interactive menu.
+
+Play
   tunes search [query]        Search YouTube and play one track
-  tunes bg [query]            Search and play in background (frees terminal immediately)
-  tunes play <url|path>       Play direct URL, YouTube link, or local audio file
-  tunes queue [query]         Search, multi-select (TAB), play as queue
-  tunes video [query]         Search and play with video window
-  tunes vlc [query]           Search and open stream in VLC
-  tunes history               Browse & replay recent tracks
-  tunes fav-add               Save a track from history to favorites
-  tunes favorites             Browse & play favorites
-  tunes fav-remove            Remove a track from favorites
+  tunes bg [query]            Same, but in the background (frees your terminal)
+  tunes play <url|path>       Play a URL, YouTube link, or local file/folder
+  tunes queue [query]         Search, multi-select (TAB), play as a queue
+  tunes add [query]           Add tracks to the queue that is playing right now
+  tunes video [query]         Search and play with a video window
+  tunes vlc [query]           Open a stream in VLC (not counted in stats)
+  tunes mix [N]               Shuffle mix from your favourites & most-played tracks
+  tunes top [period]          Browse & play your most-played tracks
+
+Library
+  tunes history               Recently played (replay)
+  tunes fav-add / favorites / fav-remove
+  tunes playlist {list|create|add|play|view|remove|delete} [name]
+                              'add <name> --now' saves the track playing right now
   tunes download [query]      Download a track as mp3 with tags & cover art
   tunes lyrics                Live lyrics via sptlrx (if installed)
-  tunes stats                 View listening stats and top tracks
 
-  --- GNOME & Playback Control ---
-  tunes status / tunes np     Show current track, elapsed time, volume, and state
-  tunes notify                Show desktop notification of current track
-  tunes ctl {action} [args]   Control playback:
-      pause                   Toggle play / pause
-      play                    Resume playback
-      stop                    Stop playback and close mpv
-      next / prev             Skip to next / previous track in queue
-      vol-up / vol-down       Increase / decrease volume (shows GNOME slider)
-      vol <0-100>             Set volume level directly
-      mute                    Toggle mute
-      seek <+/-sec>           Seek position (e.g. tunes ctl seek +15)
-      speed <rate>            Set playback speed (e.g. tunes ctl speed 1.5)
-      loop-toggle             Toggle track looping
-      loop-on / loop-off      Turn looping on or off
+Your listening
+  tunes stats [period]        Play counts, top tracks & artists, skip rate, streaks
+  tunes report [period]       Weekly-style report (default: last 7 days)
+        --ai                  add a written take from your local LLM
+        --save                keep a copy in ~/.local/share/tunes/reports/
+        --notify              desktop notification with the headline numbers
+        --json                raw numbers
+  tunes ask "question"        Ask your local LLM about your listening habits
+  periods: today | yesterday | week | month | year | all | 14d | 8w | 2026-10-01 | 2026-09
+  A "play" counts after ${PLAY_THRESHOLD}s of listening (or half of a short track).
 
-  --- Playlists ---
-  tunes playlist list         List your saved playlists
-  tunes playlist create <name>Create a new playlist
-  tunes playlist add <name>   Add a track from search or history
-  tunes playlist play <name>  Play a saved playlist
-  tunes playlist view <name>  View tracks in a playlist
-  tunes playlist delete <name>Delete a playlist
+Playback control (works from any terminal / keybinding)
+  tunes status | np           Current track, progress, volume
+  tunes ctl pause|play|stop|next|prev|mute|loop-toggle
+  tunes ctl vol <0-100> | vol-up [n] | vol-down [n] | seek <+/-sec> | speed <rate>
+  tunes ctl queue | jump <n>  Show the queue / jump to a queue position
+  tunes notify                Desktop notification for the current track
 
-  --- Podcasts ---
-  tunes pod                   Pick a subscribed feed, then an episode, and play
-  tunes pod-add [name]        Search iTunes directory & subscribe to feed
-  tunes pod-add-url <url>     Subscribe directly via RSS feed URL
-  tunes pod-feeds             List your podcast subscriptions
-  tunes pod-history           Browse & replay recent episodes (auto-resumes position!)
-  tunes pod-download          Download podcast episode for offline listening
-  tunes pod-remove            Unsubscribe from a feed
+Podcasts
+  tunes pod                   Pick a feed, then an episode (resumes where you left off)
+  tunes pod-add [name]        Search the iTunes directory & subscribe
+  tunes pod-add-url <url>     Subscribe via RSS feed URL
+  tunes pod-feeds | pod-history | pod-download | pod-remove
 
-  --- AI & Smart Recommendations ---
-  tunes recommend music       Suggest new tracks based on your listening history
-  tunes recommend podcast     Surface & rank unplayed episodes from your feeds
-  tunes mood [vibe]           Describe what you want to hear (e.g. "rainy lofi")
-                              Uses Ollama + Llama 3.2 to craft search & build queue
+AI & recommendations (optional, fully local)
+  tunes mood [vibe]           Describe a vibe ("rainy lofi") -> LLM builds a queue
+  tunes recommend music|podcast
+  tunes ai setup              Connect Ollama or any OpenAI-compatible local server
+  tunes ai test | models      Check the connection / list models
 
-Flags (place before the subcommand):
-  -d, --bg, --detach          Run playback in background, return terminal immediately
-  -l, --loop                  Start playback with looping enabled
-  -s, --shuffle               Shuffle playlist or queue tracks randomly
-  -h, --help                  Show this help message
+Setup
+  tunes config [show|set K V|unset K|edit|path]
+  tunes doctor                Check dependencies & connections
+  tunes completion            Bash completion:  eval "\$(tunes completion)"
 
-GNOME Integration Notes:
-  • Notifications pop up on track changes with interactive ⏯ Play/Pause and ⏭ Next buttons.
-  • MPRIS2 media controls appear in GNOME top bar (clock/notification drawer) and Lock Screen.
-  • Hardware keyboard media keys (Play, Pause, Next, Prev) work automatically system-wide.
-EOF
+Flags (before the command)
+  -d, --bg, --detach          Play in the background
+  -l, --loop                  Loop the track / queue
+  -s, --shuffle               Shuffle queues and playlists
+  -v, --version   -h, --help
+HELPEOF
 }
 
 # ---------- dispatch ----------
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
 
 LOOP=0
 SHUFFLE=0
@@ -1379,40 +2426,61 @@ while [[ "${1:-}" == -* ]]; do
     -l|--loop) LOOP=1; shift ;;
     -s|--shuffle) SHUFFLE=1; shift ;;
     -d|--bg|--detach) DETACH=1; shift ;;
+    -v|--version) echo "tunes $TUNES_VERSION"; exit 0 ;;
     -h|--help) cmd_help; exit 0 ;;
-    *) break ;;
+    *) echo "Unknown flag: $1 (see: tunes help)" >&2; exit 1 ;;
   esac
 done
 export LOOP SHUFFLE DETACH
 
-cmd="${1:-help}"; shift || true
+cmd="${1:-home}"; shift || true
+
+# Only commands that really need the heavy dependencies / state files ask for them.
 case "$cmd" in
-  search)        cmd_search "${1:-}";;
-  bg)            DETACH=1; cmd_search "${1:-}";;
-  play)          cmd_play "${1:-}";;
-  video)         cmd_video "${1:-}";;
-  vlc)           cmd_vlc "${1:-}";;
-  queue)         cmd_queue "${1:-}";;
-  history)       cmd_history;;
-  fav-add)       cmd_favorite_add;;
-  favorites)     cmd_favorites;;
-  fav-remove)    cmd_favorite_remove;;
-  download)      cmd_download "${1:-}";;
-  lyrics)        cmd_lyrics;;
-  status|np)     cmd_status;;
-  notify)        cmd_notify;;
-  ctl)           cmd_ctl "${1:-}" "${2:-}";;
-  playlist)      cmd_playlist "${@:-}";;
-  pod-add)       cmd_podcast_add "${1:-}";;
-  pod-add-url)   cmd_podcast_add_url "${1:-}" "${2:-}";;
-  pod-remove)    cmd_podcast_remove;;
-  pod-feeds)     cmd_podcast_feeds;;
-  pod)           cmd_podcast_play;;
-  pod-history)   cmd_podcast_history;;
-  pod-download)  cmd_podcast_download;;
-  recommend)     cmd_recommend "${1:-}";;
-  mood)          cmd_mood "${1:-}";;
-  stats)         cmd_stats;;
-  completion)    cmd_completion;;
-  help|-h|--help|*) cmd_help;;
+  help|version|completion|doctor|config|ai) ;;
+  stats|report|ask) require python3; init_state ;;
+  ctl|status|np|notify) require python3 ;;
+  *) require mpv yt-dlp fzf python3 curl jq; init_state ;;
+esac
+
+case "$cmd" in
+  home|menu)       cmd_home ;;
+  search)          cmd_search "$*" ;;
+  bg)              DETACH=1; cmd_search "$*" ;;
+  play)            cmd_play "${1:-}" ;;
+  video)           cmd_video "$*" ;;
+  vlc)             cmd_vlc "$*" ;;
+  queue)           cmd_queue "$*" ;;
+  add)             cmd_add "$*" ;;
+  history|recent)  cmd_history ;;
+  fav-add)         cmd_favorite_add ;;
+  favorites|favs)  cmd_favorites ;;
+  fav-remove)      cmd_favorite_remove ;;
+  download)        cmd_download "$*" ;;
+  lyrics)          cmd_lyrics ;;
+  status|np)       cmd_status ;;
+  notify)          cmd_notify ;;
+  ctl)             cmd_ctl "${1:-}" "${2:-}" ;;
+  playlist)        cmd_playlist "$@" ;;
+  pod-add)         cmd_podcast_add "$*" ;;
+  pod-add-url)     cmd_podcast_add_url "${1:-}" "${2:-}" ;;
+  pod-remove)      cmd_podcast_remove ;;
+  pod-feeds)       cmd_podcast_feeds ;;
+  pod)             cmd_podcast_play ;;
+  pod-history)     cmd_podcast_history ;;
+  pod-download)    cmd_podcast_download ;;
+  recommend)       cmd_recommend "${1:-}" ;;
+  mood)            cmd_mood "$*" ;;
+  top)             cmd_top "${1:-all}" ;;
+  mix)             cmd_mix "${1:-25}" ;;
+  stats)           cmd_stats "$@" ;;
+  report)          cmd_report "$@" ;;
+  ask)             cmd_ask "$@" ;;
+  ai)              cmd_ai "$@" ;;
+  config)          cmd_config "$@" ;;
+  doctor)          cmd_doctor ;;
+  completion)      cmd_completion ;;
+  version)         echo "tunes $TUNES_VERSION" ;;
+  help)            cmd_help ;;
+  *) echo "Unknown command: $cmd" >&2; echo "Run 'tunes help' to see what's available." >&2; exit 1 ;;
 esac
