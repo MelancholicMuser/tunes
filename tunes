@@ -8,7 +8,8 @@
 
 set -euo pipefail
 
-TUNES_VERSION="2.0.0"
+TUNES_VERSION="2.1.0"
+SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
 
 # ---------- paths ----------
 
@@ -24,6 +25,7 @@ PLAYS_FILE="$DATA_DIR/plays.tsv"              # epoch\tkind\tlistened\tduration\
 QUEUE_FILE="$DATA_DIR/current-queue.m3u"
 LOG_FILE="$DATA_DIR/tunes.log"
 LAST_REPORT_FILE="$DATA_DIR/.last_report"
+AUTOPLAY_STATE_FILE="$DATA_DIR/.autoplay_state"
 DOWNLOAD_DIR="${TUNES_DOWNLOAD_DIR:-$HOME/Music/tunes-downloads}"
 POD_DOWNLOAD_DIR="$DOWNLOAD_DIR/Podcasts"
 
@@ -35,7 +37,7 @@ MPV_SOCKET="${RUNTIME_BASE}/tunes-mpv-${UID:-$(id -u)}.sock"
 # variables always override it. Manage with:  tunes config
 
 CONFIG_FILE="${TUNES_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/tunes/config}"
-CONFIG_KEYS=(LLM_BACKEND LLM_URL LLM_MODEL LLM_API_KEY LLM_TIMEOUT YT_CLIENT PLAY_THRESHOLD REPORT_REMINDER DEFAULT_VOLUME)
+CONFIG_KEYS=(LLM_BACKEND LLM_URL LLM_MODEL LLM_API_KEY LLM_TIMEOUT YT_CLIENT PLAY_THRESHOLD REPORT_REMINDER DEFAULT_VOLUME AUTOPLAY)
 
 is_config_key() {
   local k
@@ -75,6 +77,20 @@ YT_CLIENT="${YT_CLIENT-android}"        # set empty to stop forcing a YouTube cl
 PLAY_THRESHOLD="${PLAY_THRESHOLD:-30}"  # seconds of listening that count as one "play"
 REPORT_REMINDER="${REPORT_REMINDER:-on}"
 DEFAULT_VOLUME="${DEFAULT_VOLUME:-}"
+AUTOPLAY="${AUTOPLAY:-on}"
+
+get_autoplay_state() {
+  if [[ -f "$AUTOPLAY_STATE_FILE" ]]; then
+    local s; s=$(tr -d ' \r\n' < "$AUTOPLAY_STATE_FILE" 2>/dev/null || true)
+    if [[ -n "$s" ]]; then printf '%s' "$s"; return 0; fi
+  fi
+  printf '%s' "${AUTOPLAY:-on}"
+}
+
+set_autoplay_state() {
+  mkdir -p "$DATA_DIR"
+  printf '%s\n' "$1" > "$AUTOPLAY_STATE_FILE"
+}
 
 # ---------- small helpers ----------
 
@@ -300,6 +316,94 @@ mp.register_event("shutdown", flush)
 LUAEOF
 }
 
+# Writes the autoplay / Up Next mpv script (re-written whenever version stamp is missing)
+ensure_autoplay() {
+  local f="$SCRIPTS_DIR/tunes-autoplay.lua"
+  grep -q 'tunes-lua-autoplay v1' "$f" 2>/dev/null && return 0
+  mkdir -p "$SCRIPTS_DIR"
+  cat > "$f" <<'LUAEOF'
+-- tunes-lua-autoplay v1: Spotify-style Autoplay & Up Next
+local mp = require 'mp'
+
+local tunes_bin = os.getenv("TUNES_BIN") or "tunes"
+local data_dir = os.getenv("TUNES_DATA_DIR") or (os.getenv("HOME") .. "/.local/share/tunes")
+local autoplay_file = os.getenv("TUNES_AUTOPLAY_FILE") or (data_dir .. "/.autoplay_state")
+local default_autoplay = os.getenv("TUNES_AUTOPLAY") or "on"
+local kind = os.getenv("TUNES_KIND") or "music"
+
+local fetching = false
+local last_fetched_url = ""
+
+local function is_enabled()
+    if kind ~= "music" then return false end
+    local f = io.open(autoplay_file, "r")
+    if f then
+        local s = f:read("*all")
+        f:close()
+        s = s:gsub("%s+", ""):lower()
+        if s == "off" or s == "0" or s == "false" then return false end
+        if s == "on" or s == "1" or s == "true" then return true end
+    end
+    return default_autoplay == "on" or default_autoplay == "1" or default_autoplay == "true"
+end
+
+local function is_looping()
+    local lf = mp.get_property("loop-file") or "no"
+    local lp = mp.get_property("loop-playlist") or "no"
+    return lf == "inf" or lf == "yes" or lp == "inf" or lp == "yes"
+end
+
+local function is_streaming(url)
+    return tostring(url or ""):match("^https?://") ~= nil
+end
+
+local function check_and_replenish()
+    if not is_enabled() then return end
+    if is_looping() then return end
+    if fetching then return end
+
+    local cur_url = mp.get_property("path") or ""
+    if cur_url == "" or not is_streaming(cur_url) or cur_url == last_fetched_url then return end
+
+    local count = mp.get_property_number("playlist-count", 0)
+    local pos = mp.get_property_number("playlist-pos-1", 0)
+    local remaining = count - pos
+
+    if remaining > 1 then return end
+
+    local cur_title = mp.get_property("media-title") or ""
+
+    fetching = true
+    last_fetched_url = cur_url
+
+    mp.command_native_async({
+        name = "subprocess",
+        playback_only = false,
+        capture_stdout = true,
+        args = { tunes_bin, "__upnext_fetch", cur_url, cur_title }
+    }, function(success, res, err)
+        fetching = false
+        if success and res and res.stdout and res.stdout ~= "" then
+            local m3u_path = res.stdout:gsub("[\r\n]+", "")
+            if m3u_path ~= "" then
+                mp.commandv("loadlist", m3u_path, "append")
+            end
+        end
+    end)
+end
+
+mp.register_event("file-loaded", function()
+    check_and_replenish()
+end)
+
+mp.observe_property("loop-file", "string", function(_, val)
+    if val ~= "inf" and val ~= "yes" then
+        check_and_replenish()
+    end
+end)
+LUAEOF
+}
+
 # ---------- mpv IPC ----------
 # mpv_ipc '<json command array>' [mode]
 #   mode 0: fire & check (default)   1: print the scalar result   2: print JSON result
@@ -494,6 +598,8 @@ build_mpv_args() {
   if [[ -f "$SCRIPTS_DIR/mpris.so" && ! -f "$HOME/.config/mpv/scripts/mpris.so" ]]; then
     MPV_BASE+=(--scripts-append="$SCRIPTS_DIR/mpris.so")
   fi
+  ensure_autoplay
+  [[ -f "$SCRIPTS_DIR/tunes-autoplay.lua" ]] && MPV_BASE+=(--scripts-append="$SCRIPTS_DIR/tunes-autoplay.lua")
   if [[ "$DEFAULT_VOLUME" =~ ^[0-9]+$ ]]; then MPV_BASE+=(--volume="$DEFAULT_VOLUME"); fi
   return 0
 }
@@ -513,6 +619,8 @@ launch_mpv() {
   stop_previous
   build_mpv_args
   export TUNES_PLAYS_FILE="$PLAYS_FILE" TUNES_KIND="$kind"
+  export TUNES_BIN="$SELF" TUNES_DATA_DIR="$DATA_DIR"
+  export TUNES_AUTOPLAY_FILE="$AUTOPLAY_STATE_FILE" TUNES_AUTOPLAY="${AUTOPLAY:-on}"
   if [[ "${DETACH:-0}" == "1" ]]; then
     nohup mpv "${MPV_BASE[@]}" "$@" </dev/null >"$LOG_FILE" 2>&1 &
     local pid=$!
@@ -879,6 +987,17 @@ if dur > 0:
 
 loop_str = "Track" if loop_file in ("inf", "yes") else ("Playlist" if loop_pl in ("inf", "yes") else "Off")
 
+import os
+ap_file = os.environ.get("TUNES_AUTOPLAY_FILE") or os.path.expanduser("~/.local/share/tunes/.autoplay_state")
+ap_state = "on"
+try:
+    with open(ap_file) as _f:
+        _s = _f.read().strip().lower()
+        if _s in ("off", "0", "false"):
+            ap_state = "off"
+except Exception:
+    pass
+
 print("🎵 Tunes Status:")
 print(f"  Track:    {title}")
 if artist and artist not in title:
@@ -888,6 +1007,7 @@ print(f"  Progress: {time_str}{bar}")
 print(f"  Volume:   {int(vol)}%")
 print(f"  Speed:    {speed:.2f}x")
 print(f"  Loop:     {loop_str}")
+print(f"  Autoplay: {ap_state.upper()}")
 PYEOF
 }
 
@@ -2050,6 +2170,147 @@ cmd_add() {
 }
 
 # ======================================================================
+#  Autoplay / Up Next  — Spotify-style "Radio" that never stops
+# ======================================================================
+
+# Internal command called by tunes-autoplay.lua when the queue is nearly
+# exhausted.  Fetches similar tracks via YouTube's Radio Mix, writes them
+# to a temp m3u, and prints the m3u path on stdout.  mpv loadlist-appends
+# it so playback never stops.
+__upnext_fetch() {
+  local url="$1" title="${2:-}"
+  [[ -z "$url" ]] && exit 1
+
+  # Extract a YouTube video ID from the URL if present
+  local vid=""
+  if [[ "$url" =~ youtube\.com/watch\?v=([A-Za-z0-9_-]+) ]]; then
+    vid="${BASH_REMATCH[1]}"
+  elif [[ "$url" =~ youtu\.be/([A-Za-z0-9_-]+) ]]; then
+    vid="${BASH_REMATCH[1]}"
+  fi
+
+  local tracks=""
+
+  # Strategy 1: YouTube Radio Mix (RD{vid}) — most similar
+  if [[ -n "$vid" ]]; then
+    tracks=$(yt-dlp --flat-playlist --dump-json --no-warnings \
+      -I "2:7" "https://www.youtube.com/watch?v=${vid}&list=RD${vid}" 2>/dev/null \
+      | jq -r '[.title, (.url // ("https://www.youtube.com/watch?v=" + .id))] | @tsv' 2>/dev/null \
+      | awk -F'\t' 'NF==2 && $1!="" && $2!=""' || true)
+  fi
+
+  # Strategy 2: keyword search derived from history (fallback)
+  if [[ -z "$tracks" ]]; then
+    local kw
+    kw=$(clean_title "$title" | top_words 2 2>/dev/null \
+      | head -n 1 | tr '\n' ' ' || true)
+    [[ -z "$kw" ]] && exit 0
+    tracks=$(search_and_pick "$kw" 6 2>/dev/null | head -n 5 || true)
+  fi
+
+  [[ -z "$tracks" ]] && exit 0
+
+  # Exclude URLs already in the current mpv playlist to avoid repeats
+  local played_urls
+  played_urls=$(mpv_ipc '["get_property","playlist"]' 2 2>/dev/null \
+    | python3 -c 'import sys,json; [print(e.get("filename","")) for e in json.load(sys.stdin)]' \
+    2>/dev/null || true)
+
+  local m3u
+  m3u=$(mktemp "${RUNTIME_BASE}/tunes-upnext-XXXXXX.m3u")
+  printf '#EXTM3U\n' > "$m3u"
+  local count=0
+  while IFS=$'\t' read -r t u; do
+    [[ -z "$u" ]] && continue
+    if echo "$played_urls" | grep -qF "$u" 2>/dev/null; then continue; fi
+    clean=$(clean_title "$t")
+    log_history "$t" "$u"
+    printf '#EXTINF:-1,%s\n%s\n' "$clean" "$u" >> "$m3u"
+    count=$((count + 1))
+  done <<< "$tracks"
+
+  if (( count == 0 )); then rm -f "$m3u"; exit 0; fi
+  printf '%s\n' "$m3u"
+}
+
+# Toggle / query autoplay state, or show the interactive Up Next panel.
+cmd_autoplay() {
+  local sub="${1:-status}"
+  case "$sub" in
+    on)
+      set_autoplay_state "on"
+      # If something is already playing, hot-patch the state file (Lua reads it on-demand)
+      echo "✅ Autoplay ON — similar tracks will be queued automatically"
+      desktop_notify "Tunes" "Autoplay enabled" "media-playlist-repeat" 2>/dev/null || true
+      ;;
+    off)
+      set_autoplay_state "off"
+      echo "⏹ Autoplay OFF"
+      desktop_notify "Tunes" "Autoplay disabled" "media-playlist-repeat" 2>/dev/null || true
+      ;;
+    toggle)
+      local cur; cur=$(get_autoplay_state)
+      if [[ "$cur" == "off" ]]; then cmd_autoplay on; else cmd_autoplay off; fi
+      ;;
+    status|"")
+      local cur; cur=$(get_autoplay_state)
+      if [[ "$cur" == "off" ]]; then
+        echo "Autoplay: OFF  (tunes autoplay on  — to enable)"
+      else
+        echo "Autoplay: ON   (tunes autoplay off — to disable)"
+      fi
+      ;;
+    *)
+      echo "Usage: tunes autoplay [on|off|toggle|status]" >&2; return 1 ;;
+  esac
+}
+
+# Show and interact with the Up Next queue (tracks scheduled to play after the
+# current one, including autoplay suggestions).
+cmd_upnext() {
+  if ! mpv_ipc '["get_property","pid"]' 0 >/dev/null 2>&1; then
+    echo "Nothing is playing."; return 0
+  fi
+
+  local ap; ap=$(get_autoplay_state)
+  local ap_indicator; [[ "$ap" == "off" ]] && ap_indicator=" [Autoplay OFF]" || ap_indicator=" [Autoplay ON]"
+
+  local pl
+  pl=$(mpv_ipc '["get_property","playlist"]' 2) || { echo "Could not read queue."; return 0; }
+
+  local action
+  action=$(python3 - "$pl" <<'PYEOF'
+import sys, json
+
+data = json.loads(sys.argv[1])
+cur_idx = next((i for i, e in enumerate(data) if e.get("current")), 0)
+
+print("  [Now Playing]")
+for i, e in enumerate(data):
+    title = e.get("title") or e.get("filename", "Unknown")
+    if len(title) > 72:
+        title = title[:69] + "…"
+    prefix = "▶" if e.get("current") else " "
+    num = i + 1
+    if i < cur_idx:
+        print(f"  {prefix} {num:2}. {title}")
+    elif e.get("current"):
+        print(f"  {prefix} {num:2}. {title}  ← now playing")
+    else:
+        print(f"  {prefix} {num:2}. {title}")
+PYEOF
+  )
+
+  echo "🎵 Up Next queue${ap_indicator}:"
+  echo "$action"
+  echo
+  echo "  Commands: tunes add [query]  — add to queue"
+  echo "            tunes ctl jump N   — jump to entry N"
+  echo "            tunes ctl next     — skip to next"
+  echo "            tunes autoplay on|off|toggle"
+}
+
+# ======================================================================
 #  AI connection, config, doctor
 # ======================================================================
 
@@ -2147,6 +2408,9 @@ config_set() {
     LLM_TIMEOUT|PLAY_THRESHOLD) [[ "$val" =~ ^[0-9]+$ ]] && ((10#$val > 0)) || { echo "$key must be a positive whole number" >&2; return 1; } ;;
     DEFAULT_VOLUME) [[ -z "$val" || "$val" =~ ^[0-9]+$ ]] || { echo "DEFAULT_VOLUME must be a number (e.g. 70) or empty" >&2; return 1; } ;;
     REPORT_REMINDER) [[ "$val" =~ ^(on|off)$ ]] || { echo "REPORT_REMINDER must be 'on' or 'off'" >&2; return 1; } ;;
+    AUTOPLAY) [[ "$val" =~ ^(on|off)$ ]] || { echo "AUTOPLAY must be 'on' or 'off'" >&2; return 1; }
+      # Write to state file immediately so live mpv sessions pick it up
+      set_autoplay_state "$val" ;;
   esac
   mkdir -p "$(dirname "$CONFIG_FILE")"
   touch "$CONFIG_FILE"; chmod 600 "$CONFIG_FILE" 2>/dev/null || true
@@ -2267,27 +2531,42 @@ controls_menu() {
   local act parts
   while true; do
     local np; np=$(now_playing_line || true)
+    local ap_label; ap_label=$(get_autoplay_state)
+    [[ "$ap_label" == "off" ]] && ap_label="🔀  Autoplay: OFF (toggle on)" || ap_label="🔀  Autoplay: ON  (toggle off)"
     act=$(printf '%s\t%s\n' \
-      "pause"       "⏯   Play / pause" \
-      "next"        "⏭   Next track" \
-      "prev"        "⏮   Previous track" \
-      "vol-up"      "🔊  Volume up" \
-      "vol-down"    "🔉  Volume down" \
-      "mute"        "🔇  Mute / unmute" \
-      "seek +15"    "⏩  Forward 15s" \
-      "seek -15"    "⏪  Back 15s" \
-      "loop-toggle" "🔁  Toggle loop" \
-      "queue"       "📜  Show queue" \
-      "stop"        "⏹   Stop" \
+      "pause"              "⏯   Play / pause" \
+      "next"               "⏭   Next track" \
+      "prev"               "⏮   Previous track" \
+      "vol-up"             "🔊  Volume up" \
+      "vol-down"           "🔉  Volume down" \
+      "mute"               "🔇  Mute / unmute" \
+      "seek +15"           "⏩  Forward 15s" \
+      "seek -15"           "⏪  Back 15s" \
+      "loop-toggle"        "🔁  Toggle loop" \
+      "autoplay-toggle"    "$ap_label" \
+      "queue"              "📜  Show queue" \
+      "upnext"             "🎵  Up Next / autoplay queue" \
+      "stop"               "⏹   Stop" \
       | fzf --delimiter='\t' --with-nth=2 --prompt="controls > " --header="${np:-Nothing playing}" \
-            --height=50% --border --reverse | cut -f1) || return 0
+            --height=55% --border --reverse | cut -f1) || return 0
     [[ -z "$act" ]] && return 0
-    IFS=' ' read -ra parts <<<"$act"
-    "$SELF" ctl "${parts[@]}" || true
-    if [[ "$act" == "queue" ]]; then read -rp "↵ " _ || true; fi
+    case "$act" in
+      autoplay-toggle)
+        "$SELF" autoplay toggle || true
+        sleep 0.4 ;;
+      upnext)
+        "$SELF" upnext || true
+        read -rp "↵ " _ || true ;;
+      queue)
+        IFS=' ' read -ra parts <<< "$act"
+        "$SELF" ctl "${parts[@]}" || true
+        read -rp "↵ " _ || true ;;
+      *)
+        IFS=' ' read -ra parts <<< "$act"
+        "$SELF" ctl "${parts[@]}" || true ;;
+    esac
   done
 }
-
 cmd_home() {
   if [[ ! -t 0 || ! -t 1 ]]; then cmd_help; return 0; fi
   local choice key parts np rem header
@@ -2324,10 +2603,10 @@ _tunes_completions() {
   prev="${COMP_WORDS[COMP_CWORD-1]}"
   prev2=""; (( COMP_CWORD > 1 )) && prev2="${COMP_WORDS[COMP_CWORD-2]}"
 
-  subcmds="home search bg play video vlc queue add history fav-add favorites fav-remove download lyrics ctl status np notify top mix stats report ask ai config doctor pod pod-add pod-add-url pod-feeds pod-history pod-download pod-remove recommend mood playlist completion version help"
+  subcmds="home search bg play video vlc queue add history fav-add favorites fav-remove download lyrics ctl status np notify top mix stats report ask ai config doctor pod pod-add pod-add-url pod-feeds pod-history pod-download pod-remove recommend mood playlist autoplay upnext completion version help"
 
   if [[ "$prev2" == "config" && ( "$prev" == "set" || "$prev" == "unset" ) ]]; then
-    COMPREPLY=( $(compgen -W "LLM_BACKEND LLM_URL LLM_MODEL LLM_API_KEY LLM_TIMEOUT YT_CLIENT PLAY_THRESHOLD REPORT_REMINDER DEFAULT_VOLUME" -- "$cur") ); return 0
+    COMPREPLY=( $(compgen -W "LLM_BACKEND LLM_URL LLM_MODEL LLM_API_KEY LLM_TIMEOUT YT_CLIENT PLAY_THRESHOLD REPORT_REMINDER DEFAULT_VOLUME AUTOPLAY" -- "$cur") ); return 0
   fi
   case "$prev" in
     tunes|-d|-l|-s|--bg|--detach|--loop|--shuffle) COMPREPLY=( $(compgen -W "$subcmds" -- "$cur") ) ;;
@@ -2338,6 +2617,7 @@ _tunes_completions() {
     report)    COMPREPLY=( $(compgen -W "today yesterday week month year all --ai --save --notify --json" -- "$cur") ) ;;
     config)    COMPREPLY=( $(compgen -W "show set unset edit path" -- "$cur") ) ;;
     ai)        COMPREPLY=( $(compgen -W "test setup models" -- "$cur") ) ;;
+    autoplay)  COMPREPLY=( $(compgen -W "on off toggle status" -- "$cur") ) ;;
   esac
   return 0
 }
@@ -2382,11 +2662,14 @@ Your listening
   A "play" counts after ${PLAY_THRESHOLD}s of listening (or half of a short track).
 
 Playback control (works from any terminal / keybinding)
-  tunes status | np           Current track, progress, volume
+  tunes status | np           Current track, progress, volume, autoplay state
   tunes ctl pause|play|stop|next|prev|mute|loop-toggle
   tunes ctl vol <0-100> | vol-up [n] | vol-down [n] | seek <+/-sec> | speed <rate>
   tunes ctl queue | jump <n>  Show the queue / jump to a queue position
   tunes notify                Desktop notification for the current track
+  tunes autoplay [on|off|toggle|status]
+                              Enable/disable Spotify-style "Up Next" auto-queuing
+  tunes upnext                Show & interact with the Up Next queue
 
 Podcasts
   tunes pod                   Pick a feed, then an episode (resumes where you left off)
@@ -2481,6 +2764,9 @@ case "$cmd" in
   doctor)          cmd_doctor ;;
   completion)      cmd_completion ;;
   version)         echo "tunes $TUNES_VERSION" ;;
+  autoplay)        cmd_autoplay "${1:-status}" ;;
+  upnext)          cmd_upnext ;;
+  __upnext_fetch)  __upnext_fetch "${1:-}" "${2:-}" ;;
   help)            cmd_help ;;
   *) echo "Unknown command: $cmd" >&2; echo "Run 'tunes help' to see what's available." >&2; exit 1 ;;
 esac
