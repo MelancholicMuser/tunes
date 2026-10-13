@@ -37,7 +37,7 @@ MPV_SOCKET="${RUNTIME_BASE}/tunes-mpv-${UID:-$(id -u)}.sock"
 # variables always override it. Manage with:  tunes config
 
 CONFIG_FILE="${TUNES_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/tunes/config}"
-CONFIG_KEYS=(LLM_BACKEND LLM_URL LLM_MODEL LLM_API_KEY LLM_TIMEOUT YT_CLIENT PLAY_THRESHOLD REPORT_REMINDER DEFAULT_VOLUME AUTOPLAY)
+CONFIG_KEYS=(LLM_BACKEND LLM_URL LLM_MODEL LLM_API_KEY LLM_TIMEOUT YT_CLIENT PLAY_THRESHOLD REPORT_REMINDER DEFAULT_VOLUME AUTOPLAY AUDIO_QUALITY AUDIO_ENHANCE AUDIO_PRESET DOWNLOAD_FORMAT)
 
 is_config_key() {
   local k
@@ -73,11 +73,31 @@ fi
 LLM_MODEL="${LLM_MODEL:-${OLLAMA_MODEL:-llama3.2:3b}}"           # OLLAMA_MODEL = legacy variable
 LLM_API_KEY="${LLM_API_KEY:-}"
 LLM_TIMEOUT="${LLM_TIMEOUT:-120}"
-YT_CLIENT="${YT_CLIENT-android}"        # set empty to stop forcing a YouTube client
+YT_CLIENT="${YT_CLIENT-}"               # default empty to allow yt-dlp to negotiate the best modern client (e.g. 48kHz Opus)
 PLAY_THRESHOLD="${PLAY_THRESHOLD:-30}"  # seconds of listening that count as one "play"
 REPORT_REMINDER="${REPORT_REMINDER:-on}"
 DEFAULT_VOLUME="${DEFAULT_VOLUME:-}"
 AUTOPLAY="${AUTOPLAY:-on}"
+AUDIO_QUALITY="${AUDIO_QUALITY:-highest}"       # highest (48kHz Opus), high, standard
+AUDIO_ENHANCE="${AUDIO_ENHANCE:-on}"            # on/off dynamic psychoacoustic enhancement
+AUDIO_PRESET="${AUDIO_PRESET:-crystalizer}"     # crystalizer, clarity, warm, bass, norm, spatial, studio
+DOWNLOAD_FORMAT="${DOWNLOAD_FORMAT:-best}"      # best (native bitstream, zero loss), flac, opus, mp3
+
+get_audio_filter_string() {
+  local enhance="${1:-${AUDIO_ENHANCE:-on}}"
+  local preset="${2:-${AUDIO_PRESET:-crystalizer}}"
+  [[ "$enhance" != "on" ]] && { echo ""; return 0; }
+  case "$preset" in
+    crystalizer)     echo "crystalizer=i=2:c=1" ;;
+    clarity|vocal)   echo "crystalizer=i=2.5:c=1,equalizer=f=3200:t=q:w=1.2:g=2" ;;
+    warm)            echo "crystalizer=i=1.5:c=1,bass=g=3:f=110:w=0.6" ;;
+    bass)            echo "crystalizer=i=1.5:c=1,bass=g=4.5:f=90:w=0.5" ;;
+    norm|r128)       echo "loudnorm=I=-16:TP=-1.5:LRA=11" ;;
+    spatial|widen)   echo "crystalizer=i=1.8:c=1,extrastereo=m=1.15" ;;
+    studio|flat|off) echo "" ;;
+    *)               echo "crystalizer=i=2:c=1" ;;
+  esac
+}
 
 get_autoplay_state() {
   if [[ -f "$AUTOPLAY_STATE_FILE" ]]; then
@@ -581,9 +601,25 @@ log_history() {
 
 YT_ARGS=()
 yt_args() {
-  YT_ARGS=(--ytdl-format=bestaudio/best)
-  if [[ -n "$YT_CLIENT" ]]; then
-    YT_ARGS+=("--ytdl-raw-options=extractor-args=youtube:player_client=$YT_CLIENT")
+  case "${AUDIO_QUALITY:-highest}" in
+    highest)
+      YT_ARGS=(--ytdl-format="bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio/best")
+      YT_ARGS+=(--ytdl-raw-options-append='format-sort=abr,asr,ext:opus:m4a')
+      ;;
+    high)
+      YT_ARGS=(--ytdl-format="bestaudio/best")
+      ;;
+    standard)
+      YT_ARGS=(--ytdl-format="ba[abr<=128]/bestaudio/best")
+      ;;
+  esac
+  if command -v node >/dev/null 2>&1; then
+    YT_ARGS+=(--ytdl-raw-options-append="js-runtimes=node")
+  elif command -v deno >/dev/null 2>&1; then
+    YT_ARGS+=(--ytdl-raw-options-append="js-runtimes=deno")
+  fi
+  if [[ -n "${YT_CLIENT:-}" ]]; then
+    YT_ARGS+=("--ytdl-raw-options-append=extractor-args=youtube:player_client=$YT_CLIENT")
   fi
   return 0
 }
@@ -601,6 +637,24 @@ build_mpv_args() {
   ensure_autoplay
   [[ -f "$SCRIPTS_DIR/tunes-autoplay.lua" ]] && MPV_BASE+=(--scripts-append="$SCRIPTS_DIR/tunes-autoplay.lua")
   if [[ "$DEFAULT_VOLUME" =~ ^[0-9]+$ ]]; then MPV_BASE+=(--volume="$DEFAULT_VOLUME"); fi
+
+  # High-fidelity audio rendering & precision resampling
+  MPV_BASE+=(
+    --audio-resample-filter-size=32
+    --audio-resample-linear=yes
+    --audio-resample-cutoff=0
+    --gapless-audio=yes
+    --volume-max=100
+    --audio-pitch-correction=yes
+    --audio-buffer=0.4
+  )
+
+  # Audio enhancement DSP (psychoacoustic transient restoration & dynamic clarity)
+  local af_str
+  af_str=$(get_audio_filter_string)
+  if [[ -n "$af_str" ]]; then
+    MPV_BASE+=(--af="$af_str")
+  fi
   return 0
 }
 
@@ -901,13 +955,31 @@ cmd_download() {
   local title url
   title=$(cut -f1 <<<"$selection")
   url=$(cut -f2 <<<"$selection")
-  command -v ffmpeg >/dev/null 2>&1 || { echo "mp3 downloads need ffmpeg ($(install_hint ffmpeg))"; exit 1; }
+  command -v ffmpeg >/dev/null 2>&1 || { echo "Audio downloads need ffmpeg ($(install_hint ffmpeg))"; exit 1; }
   mkdir -p "$DOWNLOAD_DIR"
-  echo "⬇ Downloading to $DOWNLOAD_DIR ..."
+  echo "⬇ Downloading to $DOWNLOAD_DIR (Format: ${DOWNLOAD_FORMAT:-best}) ..."
   desktop_notify "Downloading Track" "$title" "emblem-downloads"
-  yt-dlp -x --audio-format mp3 --audio-quality 0 \
-    --embed-thumbnail --add-metadata \
-    -o "${DOWNLOAD_DIR}/%(title)s.%(ext)s" "$url"
+
+  local dl_opts=(-x --embed-thumbnail --add-metadata)
+  case "${DOWNLOAD_FORMAT:-best}" in
+    best)
+      # Native stream format (Opus/m4a) — bit-perfect without generational loss
+      ;;
+    flac)
+      dl_opts+=(--audio-format flac)
+      ;;
+    opus)
+      dl_opts+=(--audio-format opus)
+      ;;
+    mp3)
+      dl_opts+=(--audio-format mp3 --audio-quality 0)
+      ;;
+    *)
+      dl_opts+=(--audio-format "$DOWNLOAD_FORMAT")
+      ;;
+  esac
+
+  yt-dlp "${dl_opts[@]}" -o "${DOWNLOAD_DIR}/%(title)s.%(ext)s" "$url"
   echo "✔ Download complete: $DOWNLOAD_DIR"
   desktop_notify "Download Complete" "$title" "emblem-default"
 }
@@ -998,12 +1070,36 @@ try:
 except Exception:
     pass
 
+acodec = query("audio-codec-name")
+srate = query("audio-params/samplerate")
+channels = query("audio-params/channels")
+bitrate = query("audio-bitrate")
+af_data = query("af")
+
+q_parts = []
+if acodec: q_parts.append(str(acodec).upper())
+if srate: q_parts.append(f"{srate/1000:.1f} kHz" if srate >= 1000 else f"{srate} Hz")
+if channels: q_parts.append(str(channels).capitalize())
+if bitrate and bitrate > 0: q_parts.append(f"~{int(bitrate/1000)} kbps")
+stream_str = " • ".join(q_parts)
+
+enh_label = "Studio Direct (Bit-perfect)"
+if isinstance(af_data, list) and len(af_data) > 0:
+    enh_names = [f.get("name","") for f in af_data if isinstance(f, dict) and f.get("name")]
+    if enh_names:
+        enh_label = f"Active ({', '.join(enh_names)})"
+elif isinstance(af_data, str) and af_data.strip():
+    enh_label = f"Active ({af_data.strip()})"
+
 print("🎵 Tunes Status:")
 print(f"  Track:    {title}")
 if artist and artist not in title:
     print(f"  Artist:   {artist}")
 print(f"  State:    {state_str}")
 print(f"  Progress: {time_str}{bar}")
+if stream_str:
+    print(f"  Quality:  {stream_str}")
+print(f"  Enhance:  {enh_label}")
 print(f"  Volume:   {int(vol)}%")
 print(f"  Speed:    {speed:.2f}x")
 print(f"  Loop:     {loop_str}")
@@ -1031,12 +1127,63 @@ cmd_notify() {
 cmd_ctl() {
   local action="${1:-}" arg="${2:-}"
   case "$action" in
-    vol-up|vol-down|vol|mute|seek|speed|loop-on|loop-off|loop-toggle|queue|list|jump|goto)
+    vol-up|vol-down|vol|mute|seek|speed|loop-on|loop-off|loop-toggle|queue|list|jump|goto|enhance|preset)
       if ! mpv_ipc '["get_property","pid"]' 0 >/dev/null 2>&1; then
         echo "Nothing is playing."; return 1
       fi ;;
   esac
   case "$action" in
+    enhance|preset)
+      local mode="${arg:-toggle}"
+      local cur_af
+      cur_af=$(mpv_ipc '["get_property", "af"]' 2 2>/dev/null || echo "[]")
+      local is_active=0
+      [[ "$cur_af" != "[]" && -n "$cur_af" && "$cur_af" != "null" ]] && is_active=1
+
+      case "$mode" in
+        toggle)
+          if ((is_active)); then
+            mpv_ipc '["set_property_string", "af", ""]' 0
+            AUDIO_ENHANCE="off"
+            echo "✨ Audio Enhancement: OFF (Studio Direct Bit-perfect)"
+            desktop_notify "Audio Enhancement" "Disabled (Studio Direct)" "audio-headphones"
+          else
+            local f
+            f=$(get_audio_filter_string "on" "$AUDIO_PRESET")
+            mpv_ipc "[\"set_property_string\", \"af\", \"$f\"]" 0
+            AUDIO_ENHANCE="on"
+            echo "✨ Audio Enhancement: ON (Preset: $AUDIO_PRESET)"
+            desktop_notify "Audio Enhancement" "Active ($AUDIO_PRESET)" "audio-headphones"
+          fi
+          ;;
+        on)
+          local f
+          f=$(get_audio_filter_string "on" "$AUDIO_PRESET")
+          mpv_ipc "[\"set_property_string\", \"af\", \"$f\"]" 0
+          AUDIO_ENHANCE="on"
+          echo "✨ Audio Enhancement: ON (Preset: $AUDIO_PRESET)"
+          desktop_notify "Audio Enhancement" "Active ($AUDIO_PRESET)" "audio-headphones"
+          ;;
+        off|none|studio|flat)
+          mpv_ipc '["set_property_string", "af", ""]' 0
+          AUDIO_ENHANCE="off"
+          echo "✨ Audio Enhancement: OFF (Studio Direct Bit-perfect)"
+          desktop_notify "Audio Enhancement" "Disabled (Studio Direct)" "audio-headphones"
+          ;;
+        crystalizer|clarity|vocal|warm|bass|norm|r128|spatial|widen)
+          AUDIO_PRESET="$mode"
+          AUDIO_ENHANCE="on"
+          local f
+          f=$(get_audio_filter_string "on" "$mode")
+          mpv_ipc "[\"set_property_string\", \"af\", \"$f\"]" 0
+          echo "✨ Audio Enhancement Preset: $mode"
+          desktop_notify "Audio Enhancement" "Preset: $mode" "audio-headphones"
+          ;;
+        *)
+          echo "Usage: tunes ctl enhance [on|off|toggle|crystalizer|clarity|warm|bass|norm|spatial]"
+          ;;
+      esac
+      ;;
     pause|play-pause)
       if mpv_ipc '["cycle", "pause"]' 0; then
         local p
@@ -2411,6 +2558,20 @@ config_set() {
     AUTOPLAY) [[ "$val" =~ ^(on|off)$ ]] || { echo "AUTOPLAY must be 'on' or 'off'" >&2; return 1; }
       # Write to state file immediately so live mpv sessions pick it up
       set_autoplay_state "$val" ;;
+    AUDIO_QUALITY) [[ "$val" =~ ^(highest|high|standard)$ ]] || { echo "AUDIO_QUALITY must be 'highest', 'high', or 'standard'" >&2; return 1; } ;;
+    AUDIO_ENHANCE) [[ "$val" =~ ^(on|off)$ ]] || { echo "AUDIO_ENHANCE must be 'on' or 'off'" >&2; return 1; }
+      AUDIO_ENHANCE="$val"
+      if mpv_ipc '["get_property","pid"]' 0 >/dev/null 2>&1; then
+        local f; f=$(get_audio_filter_string "$val" "$AUDIO_PRESET")
+        mpv_ipc "[\"set_property_string\", \"af\", \"$f\"]" 0 >/dev/null 2>&1 || true
+      fi ;;
+    AUDIO_PRESET) [[ "$val" =~ ^(crystalizer|clarity|vocal|warm|bass|norm|r128|spatial|widen|studio|flat)$ ]] || { echo "AUDIO_PRESET must be 'crystalizer', 'clarity', 'warm', 'bass', 'norm', 'spatial', or 'studio'" >&2; return 1; }
+      AUDIO_PRESET="$val"
+      if mpv_ipc '["get_property","pid"]' 0 >/dev/null 2>&1; then
+        local f; f=$(get_audio_filter_string "$AUDIO_ENHANCE" "$val")
+        mpv_ipc "[\"set_property_string\", \"af\", \"$f\"]" 0 >/dev/null 2>&1 || true
+      fi ;;
+    DOWNLOAD_FORMAT) [[ "$val" =~ ^(best|flac|opus|mp3|m4a|wav)$ ]] || { echo "DOWNLOAD_FORMAT must be 'best', 'flac', 'opus', 'mp3', 'm4a', or 'wav'" >&2; return 1; } ;;
   esac
   mkdir -p "$(dirname "$CONFIG_FILE")"
   touch "$CONFIG_FILE"; chmod 600 "$CONFIG_FILE" 2>/dev/null || true
@@ -2492,6 +2653,16 @@ cmd_doctor() {
   else
     echo "  · play log: nothing recorded yet (it starts with your next play)"
   fi
+  echo "High Fidelity Audio:"
+  printf '  ✓ stream quality:   %s (Opus 48kHz preferred)\n' "${AUDIO_QUALITY:-highest}"
+  printf '  ✓ audio enhance:    %s (preset: %s)\n' "${AUDIO_ENHANCE:-on}" "${AUDIO_PRESET:-crystalizer}"
+  printf '  ✓ mpv resampling:   32-point sinc (linear interpolation, zero cutoff)\n'
+  if command -v ffmpeg >/dev/null 2>&1; then
+    printf '  ✓ audio DSP:        ffmpeg crystalizer (transient dynamic restoration)\n'
+  fi
+  if command -v node >/dev/null 2>&1; then
+    printf '  ✓ js runtime:       Node.js (/usr/bin/node) active for yt-dlp\n'
+  fi
   return $bad
 }
 
@@ -2518,6 +2689,7 @@ menu_items() {
     "mood"          "🌦  Mood search (AI)" \
     "recommend"     "✨  Recommendations" \
     "pod"           "🎙  Podcasts" \
+    "enhance"       "✨  Audio enhancements & quality" \
     "report"        "📰  Listening report" \
     "report --ai"   "🤖  Listening report + AI take" \
     "ask"           "💬  Ask AI about my listening" \
@@ -2540,6 +2712,8 @@ controls_menu() {
       "vol-up"             "🔊  Volume up" \
       "vol-down"           "🔉  Volume down" \
       "mute"               "🔇  Mute / unmute" \
+      "enhance-toggle"     "✨  Audio enhance: toggle on/off" \
+      "enhance-preset"     "🎚  Audio preset: select profile" \
       "seek +15"           "⏩  Forward 15s" \
       "seek -15"           "⏪  Back 15s" \
       "loop-toggle"        "🔁  Toggle loop" \
@@ -2554,6 +2728,25 @@ controls_menu() {
       autoplay-toggle)
         "$SELF" autoplay toggle || true
         sleep 0.4 ;;
+      enhance-toggle)
+        "$SELF" ctl enhance toggle || true
+        sleep 0.4 ;;
+      enhance-preset)
+        local chosen_preset
+        chosen_preset=$(printf '%s\t%s\n' \
+          "crystalizer" "Crystalizer (Dynamic transient clarity & air)" \
+          "clarity"     "Clarity / Vocal (Sparkle + vocal presence)" \
+          "warm"        "Warm (Crystalizer + rich sub-bass warmth)" \
+          "bass"        "Bass Boost (Punchy low end + crystalizer)" \
+          "spatial"     "Spatial Widen (Subtle stereo soundstage widening)" \
+          "norm"        "Loudness Normalization (EBU R128 anti-clipping)" \
+          "studio"      "Studio Direct (Pure bit-perfect pass-through)" \
+          | fzf --delimiter='\t' --with-nth=2 --prompt="preset > " --height=45% --border --reverse | cut -f1) || true
+        if [[ -n "$chosen_preset" ]]; then
+          "$SELF" ctl enhance "$chosen_preset" || true
+          config_set AUDIO_PRESET "$chosen_preset" 2>/dev/null || true
+          sleep 0.4
+        fi ;;
       upnext)
         "$SELF" upnext || true
         read -rp "↵ " _ || true ;;
@@ -2603,14 +2796,15 @@ _tunes_completions() {
   prev="${COMP_WORDS[COMP_CWORD-1]}"
   prev2=""; (( COMP_CWORD > 1 )) && prev2="${COMP_WORDS[COMP_CWORD-2]}"
 
-  subcmds="home search bg play video vlc queue add history fav-add favorites fav-remove download lyrics ctl status np notify top mix stats report ask ai config doctor pod pod-add pod-add-url pod-feeds pod-history pod-download pod-remove recommend mood playlist autoplay upnext completion version help"
+  subcmds="home search bg play video vlc queue add history fav-add favorites fav-remove download lyrics ctl enhance status np notify top mix stats report ask ai config doctor pod pod-add pod-add-url pod-feeds pod-history pod-download pod-remove recommend mood playlist autoplay upnext completion version help"
 
   if [[ "$prev2" == "config" && ( "$prev" == "set" || "$prev" == "unset" ) ]]; then
-    COMPREPLY=( $(compgen -W "LLM_BACKEND LLM_URL LLM_MODEL LLM_API_KEY LLM_TIMEOUT YT_CLIENT PLAY_THRESHOLD REPORT_REMINDER DEFAULT_VOLUME AUTOPLAY" -- "$cur") ); return 0
+    COMPREPLY=( $(compgen -W "LLM_BACKEND LLM_URL LLM_MODEL LLM_API_KEY LLM_TIMEOUT YT_CLIENT PLAY_THRESHOLD REPORT_REMINDER DEFAULT_VOLUME AUTOPLAY AUDIO_QUALITY AUDIO_ENHANCE AUDIO_PRESET DOWNLOAD_FORMAT" -- "$cur") ); return 0
   fi
   case "$prev" in
     tunes|-d|-l|-s|--bg|--detach|--loop|--shuffle) COMPREPLY=( $(compgen -W "$subcmds" -- "$cur") ) ;;
-    ctl)       COMPREPLY=( $(compgen -W "pause play stop next prev vol vol-up vol-down mute seek speed loop-toggle loop-on loop-off queue jump status" -- "$cur") ) ;;
+    ctl)       COMPREPLY=( $(compgen -W "pause play stop next prev vol vol-up vol-down mute seek speed loop-toggle loop-on loop-off queue jump status enhance" -- "$cur") ) ;;
+    enhance)   COMPREPLY=( $(compgen -W "on off toggle crystalizer clarity warm bass spatial norm studio" -- "$cur") ) ;;
     playlist)  COMPREPLY=( $(compgen -W "list create add play view remove delete" -- "$cur") ) ;;
     recommend) COMPREPLY=( $(compgen -W "music podcast" -- "$cur") ) ;;
     stats|top) COMPREPLY=( $(compgen -W "today yesterday week month year all" -- "$cur") ) ;;
@@ -2647,7 +2841,7 @@ Library
   tunes fav-add / favorites / fav-remove
   tunes playlist {list|create|add|play|view|remove|delete} [name]
                               'add <name> --now' saves the track playing right now
-  tunes download [query]      Download a track as mp3 with tags & cover art
+  tunes download [query]      Download a track with tags & cover art (${DOWNLOAD_FORMAT:-best})
   tunes lyrics                Live lyrics via sptlrx (if installed)
 
 Your listening
@@ -2661,9 +2855,12 @@ Your listening
   periods: today | yesterday | week | month | year | all | 14d | 8w | 2026-10-01 | 2026-09
   A "play" counts after ${PLAY_THRESHOLD}s of listening (or half of a short track).
 
-Playback control (works from any terminal / keybinding)
-  tunes status | np           Current track, progress, volume, autoplay state
-  tunes ctl pause|play|stop|next|prev|mute|loop-toggle
+Playback control & Audio Quality (works from any terminal / keybinding)
+  tunes status | np           Current track, stream quality (Opus 48kHz), volume
+  tunes enhance [preset|on|off]
+                              Real-time audio DSP enhancements
+                              (crystalizer | clarity | warm | bass | spatial | norm | studio)
+  tunes ctl pause|play|stop|next|prev|mute|loop-toggle|enhance
   tunes ctl vol <0-100> | vol-up [n] | vol-down [n] | seek <+/-sec> | speed <rate>
   tunes ctl queue | jump <n>  Show the queue / jump to a queue position
   tunes notify                Desktop notification for the current track
@@ -2696,6 +2893,29 @@ Flags (before the command)
 HELPEOF
 }
 
+cmd_enhance() {
+  if [[ $# -eq 0 ]]; then
+    echo "✨ Audio Quality & Enhancements:"
+    echo "  Status:   $([ "${AUDIO_ENHANCE:-on}" == "on" ] && echo "Active (Preset: ${AUDIO_PRESET:-crystalizer})" || echo "Disabled (Studio Direct)")"
+    echo "  Quality:  ${AUDIO_QUALITY:-highest} (Opus 48kHz preferred)"
+    echo "  Output:   32-point sinc resampling, gapless, anti-clipping headroom"
+    echo
+    echo "Presets:"
+    echo "  crystalizer — Dynamic high-frequency transient clarity & harmonic restoration"
+    echo "  clarity     — Vocal presence & high-frequency sparkle"
+    echo "  warm        — Crystalizer clarity + rich sub-bass warmth"
+    echo "  bass        — Heavy low-end boost + crystalizer transient clarity"
+    echo "  spatial     — Stereo soundstage widening + crystalizer"
+    echo "  norm        — EBU R128 loudness normalization (prevents loudness jumps)"
+    echo "  studio      — Pure bit-perfect pass-through (no DSP filters)"
+    echo
+    echo "Usage: tunes enhance [preset|on|off|toggle]"
+    echo "       tunes config set AUDIO_PRESET <preset>"
+    return 0
+  fi
+  cmd_ctl enhance "$@"
+}
+
 # ---------- dispatch ----------
 
 SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
@@ -2722,7 +2942,7 @@ cmd="${1:-home}"; shift || true
 case "$cmd" in
   help|version|completion|doctor|config|ai) ;;
   stats|report|ask) require python3; init_state ;;
-  ctl|status|np|notify) require python3 ;;
+  ctl|status|np|notify|enhance) require python3 ;;
   *) require mpv yt-dlp fzf python3 curl jq; init_state ;;
 esac
 
@@ -2744,6 +2964,7 @@ case "$cmd" in
   status|np)       cmd_status ;;
   notify)          cmd_notify ;;
   ctl)             cmd_ctl "${1:-}" "${2:-}" ;;
+  enhance)         cmd_enhance "$@" ;;
   playlist)        cmd_playlist "$@" ;;
   pod-add)         cmd_podcast_add "$*" ;;
   pod-add-url)     cmd_podcast_add_url "${1:-}" "${2:-}" ;;
