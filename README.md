@@ -22,6 +22,9 @@ $ tunes report --ai          # your week in music, plus a written take from your
 - 📁 Playlists, favourites, history, mp3 downloads with cover art & tags, synced lyrics (via `sptlrx`)
 - 🎙 Podcasts: iTunes directory search or any RSS URL, auto-resume, offline downloads
 - 🔔 GNOME / desktop integration: MPRIS2 widget, media keys, actionable notifications
+- ♾ **Autoplay / Up Next** — when the queue runs out, tunes appends similar tracks (`tunes autoplay`, `tunes upnext`)
+- 😴 **Sleep timer** (fades out, then stops) and ⏰ **alarm** (wakes you with a playlist or your mix)
+- 📁 **Local library**: `tunes local` browses and plays audio files from your music folder
 
 **Know your listening**
 - 📈 **Every listening session is logged locally** — a *play* counts after 30 s (or half of a short track), shorter sessions count as *skips*
@@ -30,6 +33,14 @@ $ tunes report --ai          # your week in music, plus a written take from your
 - 🤖 **AI take on your report** and **"ask anything" about your habits** via your own local LLM
 - 🏆 `tunes top` — browse and replay your most-played tracks, ranked by plays
 - 💾 Save reports, get a desktop notification, export raw JSON, or schedule it weekly
+- 🧠 **Smart playlists from your stats**: `tunes top month --save "October favs"`, `tunes forgotten` (old favourites you haven't played in 90 days)
+- 📣 **Shareable report card**: `tunes report --card` prints a short text summary you can paste anywhere
+- 🔄 **ListenBrainz scrobbling** (`tunes scrobble`) — keep your history if you ever switch players
+
+**Library & upkeep**
+- 📤 Playlist **export / import** as M3U (`tunes playlist export|import`)
+- 💼 `tunes backup` / `tunes restore` for your play log, favourites, playlists and podcasts
+- ⬆️ `tunes update` fetches the latest script from GitHub (checks it first, keeps a `.bak`)
 
 **AI (all optional, all local)**
 - 🌦 `tunes mood "rainy day lofi for coding"` → the model writes search queries and builds a queue
@@ -111,6 +122,9 @@ $ tunes report
 | `tunes report --json` / `tunes stats --json` | Raw numbers for your own scripts |
 | `tunes ask "…"` | Ask the LLM about your habits: *"what do I listen to late at night?"* |
 | `tunes top [period]` | Browse & play your most-played tracks (`TAB` to queue several) |
+| `tunes top [period] --save NAME [-n N]` | Save your most-played tracks as a playlist instead of playing them |
+| `tunes forgotten [days]` | Tracks you played ≥3 times but not in the last N days (default 90) · `--min-plays N` · `--save NAME` |
+| `tunes report --card` | A short plain-text summary (plays, time, top track & artist, streak) to share |
 | `tunes mix [N]` | Shuffle N tracks (default 25) from favourites + most played |
 
 **Periods:** `today` · `yesterday` · `week` · `month` · `year` · `all` · `14d` · `8w` · `2026-10-01` (since) · `2026-09` (that month)
@@ -125,6 +139,77 @@ The AI never does the maths: numbers are computed by the stats engine and only a
   0 9 * * 1  DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus tunes report --ai --save --notify
   ```
 - **systemd user timer:** a `tunes-report.service` running `tunes report --ai --save --notify` plus a `tunes-report.timer` with `OnCalendar=Mon 09:00` and `Persistent=true`.
+
+---
+
+## ♾ Autoplay & Up Next
+
+When the last track of a queue starts, tunes asks YouTube for a radio mix of that track (falling back to a keyword search) and appends a handful of new tracks, skipping anything already queued.
+
+```bash
+tunes autoplay on|off|toggle|status   # works live, even while something is playing
+tunes upnext                          # see and interact with the upcoming queue
+```
+
+## 🎚 Audio quality & optional enhancement
+
+- `AUDIO_QUALITY` chooses the stream format: `highest` (prefers Opus, 48 kHz — the default), `high`, or `standard` (≤128 kbps).
+- `DOWNLOAD_FORMAT` (`best` = keep the original stream untouched, or `flac` / `opus` / `mp3` / `m4a` / `wav`) controls `tunes download`.
+- **Enhancement is off by default.** Turn it on with `tunes enhance on`, pick a preset with `tunes enhance <preset>`, or toggle it live from the menu:
+
+| Preset | What it does |
+| :--- | :--- |
+| `crystalizer` | Sharpens transients and widens dynamics (ffmpeg `crystalizer`); can sound harsh on already-loud masters |
+| `clarity` | Crystalizer plus a presence boost around 3 kHz |
+| `warm` / `bass` | Crystalizer plus a low-shelf boost |
+| `spatial` | Crystalizer plus mild stereo widening |
+| `norm` | EBU R128 loudness normalisation (no more volume jumps between tracks) |
+| `studio` | No filters |
+| `custom` | Your own chain: `tunes config set AUDIO_CUSTOM_AF 'equalizer=f=100:t=q:w=1:g=3'` |
+
+All crystalizer-based presets end in a peak limiter so the extra dynamics can't clip. `REPLAYGAIN=track|album` makes mpv honour ReplayGain tags (local files and downloads).
+
+## 😴 Timers
+
+```bash
+tunes sleep 30m            # also: 1h30m, 90s, or a bare number of minutes
+tunes sleep status | off   # the volume fades over the last 15 s, then playback stops
+tunes alarm 07:30          # starts your mix at 07:30 (tomorrow if that time has passed)
+tunes alarm 07:30 Morning  # …or the playlist called "Morning"
+tunes alarm status | off
+```
+
+The timers run as small background helpers, so they only fire while your machine is awake and logged in.
+
+## 📤 Playlists: import, export & smart playlists
+
+```bash
+tunes playlist export Morning ~/morning.m3u     # extended M3U with titles
+tunes playlist import ~/morning.m3u Morning     # also accepts .m3u8 or a plain list of URLs/paths
+tunes top month --save "October favs"           # playlists built from your own stats
+tunes forgotten 60 --save "Bring these back"
+```
+
+## 🔄 ListenBrainz scrobbling
+
+```bash
+tunes config set LISTENBRAINZ_TOKEN <your token>   # from https://listenbrainz.org/settings/
+tunes scrobble --dry-run                           # see what would be sent
+tunes scrobble                                     # submit new plays (only those that count as plays)
+```
+
+Only music plays that pass the same 30-second / half-a-track rule as your reports are sent (podcasts and plays without an artist are skipped). tunes remembers where it stopped, so re-running is safe; `--all` re-sends everything. Run it from cron if you want it automatic. `LISTENBRAINZ_URL` can point at a compatible server.
+
+## 💼 Backup, restore & update
+
+```bash
+tunes backup [dir]          # tar.gz of play log, history, favourites, playlists, podcasts, reports (newest 10 kept)
+tunes restore <archive>     # asks first; refuses archives with unsafe paths
+tunes update --check        # compare with the published version
+tunes update                # download, sanity-check, install (previous version kept as tunes.bak)
+```
+
+Backups never include your config file, so API keys and tokens stay out of archives. `tunes update` downloads over HTTPS from this repository and verifies the file looks like a valid tunes script before replacing anything; if you prefer, update with `git pull && ./install.sh` instead.
 
 ---
 
@@ -159,7 +244,17 @@ Reasoning models that emit `<think>…</think>` are handled (the thinking is str
 | `PLAY_THRESHOLD` | `30` | seconds of listening that count as a play |
 | `REPORT_REMINDER` | `on` | weekly nudge in the home menu |
 | `DEFAULT_VOLUME` | *(mpv default)* | start volume, e.g. `70` |
-| `YT_CLIENT` | `android` | YouTube client passed to yt-dlp; set empty to stop overriding it if streams ever fail |
+| `YT_CLIENT` | *(empty)* | YouTube client passed to yt-dlp; leave empty to let yt-dlp choose, or set e.g. `android` if streams ever fail |
+| `AUTOPLAY` | `on` | append similar tracks when a queue ends |
+| `AUDIO_QUALITY` | `highest` | `highest` · `high` · `standard` |
+| `AUDIO_ENHANCE` | `off` | `on` applies the `AUDIO_PRESET` filters |
+| `AUDIO_PRESET` | `crystalizer` | `crystalizer` · `clarity` · `warm` · `bass` · `spatial` · `norm` · `studio` · `custom` |
+| `AUDIO_CUSTOM_AF` | *(empty)* | filter chain used by the `custom` preset |
+| `REPLAYGAIN` | `off` | `track` or `album` to use ReplayGain tags |
+| `DOWNLOAD_FORMAT` | `best` | `best` · `flac` · `opus` · `mp3` · `m4a` · `wav` |
+| `MUSIC_DIR` | `~/Music` | folder browsed by `tunes local` |
+| `LISTENBRAINZ_TOKEN` | *(empty)* | user token for `tunes scrobble` (masked in `tunes config`) |
+| `LISTENBRAINZ_URL` | `https://api.listenbrainz.org` | scrobbling endpoint |
 
 The legacy `OLLAMA_URL` / `OLLAMA_MODEL` variables still work.
 
@@ -172,14 +267,16 @@ Run `tunes help` for the full list. Highlights:
 ```
 tunes                       interactive menu
 tunes search|bg|queue|video [query]     (multi-word queries need no quotes)
-tunes play <url|path>       tunes add [query]        tunes mix [N]        tunes top [period]
+tunes play <url|path>       tunes add [query]        tunes mix [N]        tunes top [period] [--save NAME]
+tunes local [folder]        tunes forgotten [days]   tunes autoplay|upnext
 tunes history | favorites | fav-add | fav-remove
-tunes playlist {list|create|add|play|view|remove|delete} [name]   ('add <name> --now' = save what's playing)
+tunes playlist {list|create|add|play|view|remove|delete|export|import} [name]   ('add <name> --now' = save what's playing)
 tunes ctl pause|play|stop|next|prev|mute|loop-toggle|vol <0-100>|seek <±sec>|speed <rate>|queue|jump <n>
 tunes status | np | notify
 tunes pod | pod-add | pod-add-url | pod-feeds | pod-history | pod-download | pod-remove
 tunes mood [vibe] | recommend music|podcast
-tunes stats | report | ask | ai | config | doctor
+tunes stats | report [--card] | ask | ai | config | doctor
+tunes sleep <30m|off|status>   tunes alarm <HH:MM> [playlist]   tunes scrobble   tunes backup|restore   tunes update
 
 Flags (before the command):  -d/--bg  background · -l/--loop · -s/--shuffle · -v/--version
 ```
@@ -195,6 +292,8 @@ Flags (before the command):  -d/--bg  background · -l/--loop · -s/--shuffle ·
 | `…/playlists/*.tsv` | saved playlists |
 | `…/feeds.tsv`, `podcast_history.tsv` | podcast subscriptions & history |
 | `…/reports/` | reports saved with `--save` |
+| `…/backups/` | archives made by `tunes backup` |
+| `…/.listenbrainz_cursor` | timestamp of the last scrobbled play |
 | `~/.config/tunes/config` | settings |
 | `~/Music/tunes-downloads/` | downloads |
 | `$XDG_RUNTIME_DIR/tunes-mpv-<uid>.sock` | mpv control socket |
@@ -208,12 +307,16 @@ Override locations with `TUNES_DATA_DIR`, `TUNES_CONFIG`, `TUNES_DOWNLOAD_DIR`.
 ## 🧪 Tests
 
 ```bash
-tests/run.sh            # ~2 minutes; needs mpv, fzf, jq, python3, curl
+tests/run.sh            # ~4 minutes; needs mpv, fzf, jq, python3, curl
 ```
 
-The suite plays real audio through `mpv` (null output) and uses mock `yt-dlp`, mock `fzf` and a fake LLM server (Ollama + OpenAI protocols) — no network or TTY needed.
+The suite plays real audio through `mpv` (null output) and uses mock `yt-dlp`, mock `fzf`, a fake LLM server (Ollama + OpenAI protocols) and a fake ListenBrainz server — no network or TTY needed. It runs on every push via GitHub Actions together with `shellcheck`.
 
 ---
+
+## 🆕 What's new in 2.2
+
+Sleep timer & alarm, smart playlists (`top --save`, `forgotten`), M3U import/export, ListenBrainz scrobbling, `backup`/`restore`/`update`, `tunes local`, `report --card`, custom EQ chains and ReplayGain. Audio enhancement is now **opt-in** and its presets end in a limiter. See [CHANGELOG.md](CHANGELOG.md) for details.
 
 ## 🆕 What changed in 2.0
 

@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-TUNES_VERSION="2.1.0"
+TUNES_VERSION="2.2.0"
 SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
 
 # ---------- paths ----------
@@ -37,7 +37,7 @@ MPV_SOCKET="${RUNTIME_BASE}/tunes-mpv-${UID:-$(id -u)}.sock"
 # variables always override it. Manage with:  tunes config
 
 CONFIG_FILE="${TUNES_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/tunes/config}"
-CONFIG_KEYS=(LLM_BACKEND LLM_URL LLM_MODEL LLM_API_KEY LLM_TIMEOUT YT_CLIENT PLAY_THRESHOLD REPORT_REMINDER DEFAULT_VOLUME AUTOPLAY AUDIO_QUALITY AUDIO_ENHANCE AUDIO_PRESET DOWNLOAD_FORMAT)
+CONFIG_KEYS=(LLM_BACKEND LLM_URL LLM_MODEL LLM_API_KEY LLM_TIMEOUT YT_CLIENT PLAY_THRESHOLD REPORT_REMINDER DEFAULT_VOLUME AUTOPLAY AUDIO_QUALITY AUDIO_ENHANCE AUDIO_PRESET AUDIO_CUSTOM_AF REPLAYGAIN DOWNLOAD_FORMAT MUSIC_DIR LISTENBRAINZ_TOKEN LISTENBRAINZ_URL)
 
 is_config_key() {
   local k
@@ -79,23 +79,31 @@ REPORT_REMINDER="${REPORT_REMINDER:-on}"
 DEFAULT_VOLUME="${DEFAULT_VOLUME:-}"
 AUTOPLAY="${AUTOPLAY:-on}"
 AUDIO_QUALITY="${AUDIO_QUALITY:-highest}"       # highest (48kHz Opus), high, standard
-AUDIO_ENHANCE="${AUDIO_ENHANCE:-on}"            # on/off dynamic psychoacoustic enhancement
-AUDIO_PRESET="${AUDIO_PRESET:-crystalizer}"     # crystalizer, clarity, warm, bass, norm, spatial, studio
+AUDIO_ENHANCE="${AUDIO_ENHANCE:-off}"           # on/off: optional DSP (opt-in; "studio" = untouched audio)
+AUDIO_PRESET="${AUDIO_PRESET:-crystalizer}"     # crystalizer, clarity, warm, bass, norm, spatial, studio, custom
 DOWNLOAD_FORMAT="${DOWNLOAD_FORMAT:-best}"      # best (native bitstream, zero loss), flac, opus, mp3
+AUDIO_CUSTOM_AF="${AUDIO_CUSTOM_AF:-}"          # your own mpv/ffmpeg filter chain, used when AUDIO_PRESET=custom
+REPLAYGAIN="${REPLAYGAIN:-off}"                 # off | track | album (reads ReplayGain tags in local files & downloads)
+MUSIC_DIR="${MUSIC_DIR:-$HOME/Music}"           # folder used by: tunes local
+LISTENBRAINZ_TOKEN="${LISTENBRAINZ_TOKEN:-}"    # user token from https://listenbrainz.org/settings/ (tunes scrobble)
+LISTENBRAINZ_URL="${LISTENBRAINZ_URL:-https://api.listenbrainz.org}"
 
 get_audio_filter_string() {
-  local enhance="${1:-${AUDIO_ENHANCE:-on}}"
+  local enhance="${1:-${AUDIO_ENHANCE:-off}}"
   local preset="${2:-${AUDIO_PRESET:-crystalizer}}"
   [[ "$enhance" != "on" ]] && { echo ""; return 0; }
+  # crystalizer exaggerates dynamics and can push peaks past 0 dBFS, so those presets end in a limiter.
+  local lim="alimiter=limit=0.97"
   case "$preset" in
-    crystalizer)     echo "crystalizer=i=2:c=1" ;;
-    clarity|vocal)   echo "crystalizer=i=2.5:c=1,equalizer=f=3200:t=q:w=1.2:g=2" ;;
-    warm)            echo "crystalizer=i=1.5:c=1,bass=g=3:f=110:w=0.6" ;;
-    bass)            echo "crystalizer=i=1.5:c=1,bass=g=4.5:f=90:w=0.5" ;;
+    crystalizer)     echo "crystalizer=i=2:c=1,$lim" ;;
+    clarity|vocal)   echo "crystalizer=i=2.5:c=1,equalizer=f=3200:t=q:w=1.2:g=2,$lim" ;;
+    warm)            echo "crystalizer=i=1.5:c=1,bass=g=3:f=110:w=0.6,$lim" ;;
+    bass)            echo "crystalizer=i=1.5:c=1,bass=g=4.5:f=90:w=0.5,$lim" ;;
     norm|r128)       echo "loudnorm=I=-16:TP=-1.5:LRA=11" ;;
-    spatial|widen)   echo "crystalizer=i=1.8:c=1,extrastereo=m=1.15" ;;
+    spatial|widen)   echo "crystalizer=i=1.8:c=1,extrastereo=m=1.15,$lim" ;;
+    custom)          echo "${AUDIO_CUSTOM_AF:-}" ;;
     studio|flat|off) echo "" ;;
-    *)               echo "crystalizer=i=2:c=1" ;;
+    *)               echo "crystalizer=i=2:c=1,$lim" ;;
   esac
 }
 
@@ -638,18 +646,16 @@ build_mpv_args() {
   [[ -f "$SCRIPTS_DIR/tunes-autoplay.lua" ]] && MPV_BASE+=(--scripts-append="$SCRIPTS_DIR/tunes-autoplay.lua")
   if [[ "$DEFAULT_VOLUME" =~ ^[0-9]+$ ]]; then MPV_BASE+=(--volume="$DEFAULT_VOLUME"); fi
 
-  # High-fidelity audio rendering & precision resampling
+  # Audio output: longer resampler filter, gapless playback, no digital gain above 100%
   MPV_BASE+=(
     --audio-resample-filter-size=32
-    --audio-resample-linear=yes
-    --audio-resample-cutoff=0
     --gapless-audio=yes
     --volume-max=100
-    --audio-pitch-correction=yes
     --audio-buffer=0.4
   )
+  [[ "${REPLAYGAIN:-off}" =~ ^(track|album)$ ]] && MPV_BASE+=(--replaygain="$REPLAYGAIN")
 
-  # Audio enhancement DSP (psychoacoustic transient restoration & dynamic clarity)
+  # Optional audio DSP (off unless AUDIO_ENHANCE=on)
   local af_str
   af_str=$(get_audio_filter_string)
   if [[ -n "$af_str" ]]; then
@@ -1083,7 +1089,7 @@ if channels: q_parts.append(str(channels).capitalize())
 if bitrate and bitrate > 0: q_parts.append(f"~{int(bitrate/1000)} kbps")
 stream_str = " • ".join(q_parts)
 
-enh_label = "Studio Direct (Bit-perfect)"
+enh_label = "Off (no filters)"
 if isinstance(af_data, list) and len(af_data) > 0:
     enh_names = [f.get("name","") for f in af_data if isinstance(f, dict) and f.get("name")]
     if enh_names:
@@ -1145,8 +1151,8 @@ cmd_ctl() {
           if ((is_active)); then
             mpv_ipc '["set_property_string", "af", ""]' 0
             AUDIO_ENHANCE="off"
-            echo "✨ Audio Enhancement: OFF (Studio Direct Bit-perfect)"
-            desktop_notify "Audio Enhancement" "Disabled (Studio Direct)" "audio-headphones"
+            echo "✨ Audio Enhancement: OFF (no filters)"
+            desktop_notify "Audio Enhancement" "Off" "audio-headphones"
           else
             local f
             f=$(get_audio_filter_string "on" "$AUDIO_PRESET")
@@ -1167,10 +1173,10 @@ cmd_ctl() {
         off|none|studio|flat)
           mpv_ipc '["set_property_string", "af", ""]' 0
           AUDIO_ENHANCE="off"
-          echo "✨ Audio Enhancement: OFF (Studio Direct Bit-perfect)"
-          desktop_notify "Audio Enhancement" "Disabled (Studio Direct)" "audio-headphones"
+          echo "✨ Audio Enhancement: OFF (no filters)"
+          desktop_notify "Audio Enhancement" "Off" "audio-headphones"
           ;;
-        crystalizer|clarity|vocal|warm|bass|norm|r128|spatial|widen)
+        crystalizer|clarity|vocal|warm|bass|norm|r128|spatial|widen|custom)
           AUDIO_PRESET="$mode"
           AUDIO_ENHANCE="on"
           local f
@@ -1180,7 +1186,7 @@ cmd_ctl() {
           desktop_notify "Audio Enhancement" "Preset: $mode" "audio-headphones"
           ;;
         *)
-          echo "Usage: tunes ctl enhance [on|off|toggle|crystalizer|clarity|warm|bass|norm|spatial]"
+          echo "Usage: tunes ctl enhance [on|off|toggle|crystalizer|clarity|warm|bass|norm|spatial|custom]"
           ;;
       esac
       ;;
@@ -1426,9 +1432,12 @@ cmd_playlist() {
       if [[ -f "$pl_file" ]]; then rm -f "$pl_file"; echo "✔ Deleted playlist: $name"
       else echo "Playlist '$name' not found."; fi
       ;;
+    export) playlist_export "$@" ;;
+    import) playlist_import "$@" ;;
     *)
-      echo "Usage: tunes playlist {list|create|add|play|view|remove|delete} [name]"
+      echo "Usage: tunes playlist {list|create|add|play|view|remove|delete|export|import} [name]"
       echo "       tunes playlist add <name> --now     (adds the track playing right now)"
+      echo "       tunes playlist export <name> [file.m3u]   |   tunes playlist import <file.m3u> [name]"
       exit 1 ;;
   esac
 }
@@ -2174,21 +2183,23 @@ wrap_text() { fold -s -w "${1:-80}"; }
 
 # tunes report [period] [--ai] [--save] [--notify] [--json]
 cmd_report() {
-  local period="week" ai=0 save=0 notify=0 json=0
+  local period="week" ai=0 save=0 notify=0 json=0 card=0
   while (($#)); do
     case "$1" in
       --ai) ai=1 ;;
       --save) save=1 ;;
       --notify) notify=1 ;;
       --json) json=1 ;;
+      --card) card=1 ;;
       -h|--help)
         cat <<'USAGE'
-Usage: tunes report [period] [--ai] [--save] [--notify] [--json]
+Usage: tunes report [period] [--ai] [--save] [--notify] [--json] [--card]
   period   today | yesterday | week (default) | month | year | all | <N>d | <N>w | YYYY-MM-DD | YYYY-MM
   --ai     add a short written take from your local LLM (see: tunes ai setup)
   --save   also write the report to ~/.local/share/tunes/reports/
   --notify send a desktop notification with the headline numbers
   --json   print the raw numbers as JSON
+  --card   print a short shareable text card (paste it anywhere)
 USAGE
         return 0 ;;
       -*) echo "Unknown option: $1 (try: tunes report --help)" >&2; exit 1 ;;
@@ -2198,6 +2209,7 @@ USAGE
   done
 
   if ((json)); then stats_engine json --period "$period"; mark_report; return 0; fi
+  if ((card)); then report_card "$period"; mark_report; return 0; fi
 
   stats_engine report --period "$period"
   mark_report
@@ -2267,17 +2279,22 @@ $(stats_engine context --period all)"
 }
 
 # tunes top [period]  — browse & play your most-played tracks
+# tunes top [period] [-n COUNT] [--save NAME]
 cmd_top() {
-  local period="${1:-all}" rows selections
-  rows=$(stats_engine top --period "$period" --limit 100)
+  local period="all" save="" limit=100 rows usage="Usage: tunes top [period] [-n COUNT] [--save PLAYLIST]"
+  while (($#)); do
+    case "$1" in
+      --save) save="${2:-}"; [[ -n "$save" ]] || { echo "$usage" >&2; return 1; }; shift 2 ;;
+      -n|--limit) limit="${2:-}"; { [[ "$limit" =~ ^[0-9]+$ ]] && ((10#$limit > 0)); } || { echo "$usage" >&2; return 1; }; shift 2 ;;
+      -h|--help) echo "$usage"; return 0 ;;
+      -*) echo "Unknown option: $1 ($usage)" >&2; return 1 ;;
+      *) period="$1"; shift ;;
+    esac
+  done
+  rows=$(stats_engine top --period "$period" --limit "$limit")
   if [[ -z "$rows" ]]; then echo "No plays logged for '$period' yet — go listen to something!"; exit 0; fi
-  selections=$(printf '%s\n' "$rows" | fzf --multi --delimiter='\t' --with-nth=1,3,4 \
-      --prompt="🔥 most played ($period) > " --header="TAB: select several · ENTER: play · ?: details" \
-      --height=70% --border --reverse \
-      --preview='echo -e "Title:   \033[1m{1}\033[0m\nArtist:  {3}\nPlays:   {4}\nURL:     {2}"' \
-      --preview-window="down:4:wrap:hidden" --bind="?:toggle-preview") || exit 0
-  [[ -z "$selections" ]] && exit 0
-  play_queue "Most played ($period)" "$selections"
+  if [[ -n "$save" ]]; then save_rows_as_playlist "$save" "$(cut -f1,2 <<<"$rows")"; return 0; fi
+  play_stats_rows "Most played ($period)" "🔥 most played ($period) > " "$rows"
 }
 
 shuffle_lines() { if command -v shuf >/dev/null 2>&1; then shuf; else sort -R; fi; }
@@ -2565,12 +2582,15 @@ config_set() {
         local f; f=$(get_audio_filter_string "$val" "$AUDIO_PRESET")
         mpv_ipc "[\"set_property_string\", \"af\", \"$f\"]" 0 >/dev/null 2>&1 || true
       fi ;;
-    AUDIO_PRESET) [[ "$val" =~ ^(crystalizer|clarity|vocal|warm|bass|norm|r128|spatial|widen|studio|flat)$ ]] || { echo "AUDIO_PRESET must be 'crystalizer', 'clarity', 'warm', 'bass', 'norm', 'spatial', or 'studio'" >&2; return 1; }
+    AUDIO_PRESET) [[ "$val" =~ ^(crystalizer|clarity|vocal|warm|bass|norm|r128|spatial|widen|studio|flat|custom)$ ]] || { echo "AUDIO_PRESET must be 'crystalizer', 'clarity', 'warm', 'bass', 'norm', 'spatial', 'studio' or 'custom'" >&2; return 1; }
       AUDIO_PRESET="$val"
       if mpv_ipc '["get_property","pid"]' 0 >/dev/null 2>&1; then
         local f; f=$(get_audio_filter_string "$AUDIO_ENHANCE" "$val")
         mpv_ipc "[\"set_property_string\", \"af\", \"$f\"]" 0 >/dev/null 2>&1 || true
       fi ;;
+    AUDIO_CUSTOM_AF) [[ "$val" != *\"* && "$val" != *\\* ]] || { echo "AUDIO_CUSTOM_AF must not contain quotes or backslashes (example: equalizer=f=100:t=q:w=1:g=3)" >&2; return 1; } ;;
+    REPLAYGAIN) [[ "$val" =~ ^(off|track|album)$ ]] || { echo "REPLAYGAIN must be 'off', 'track' or 'album'" >&2; return 1; } ;;
+    LISTENBRAINZ_URL) [[ "$val" =~ ^https?:// ]] || { echo "LISTENBRAINZ_URL must start with http:// or https://" >&2; return 1; } ;;
     DOWNLOAD_FORMAT) [[ "$val" =~ ^(best|flac|opus|mp3|m4a|wav)$ ]] || { echo "DOWNLOAD_FORMAT must be 'best', 'flac', 'opus', 'mp3', 'm4a', or 'wav'" >&2; return 1; } ;;
   esac
   mkdir -p "$(dirname "$CONFIG_FILE")"
@@ -2594,7 +2614,7 @@ cmd_config() {
       local k v o note
       for k in "${CONFIG_KEYS[@]}"; do
         v="${!k:-}"; note=""
-        [[ "$k" == LLM_API_KEY && -n "$v" ]] && v="********"
+        [[ ( "$k" == LLM_API_KEY || "$k" == LISTENBRAINZ_TOKEN ) && -n "$v" ]] && v="********"
         for o in "${ENV_OVERRIDES[@]:-}"; do
           [[ "$o" == "$k" ]] && note="   (overridden by environment variable)"
         done
@@ -2655,10 +2675,10 @@ cmd_doctor() {
   fi
   echo "High Fidelity Audio:"
   printf '  ✓ stream quality:   %s (Opus 48kHz preferred)\n' "${AUDIO_QUALITY:-highest}"
-  printf '  ✓ audio enhance:    %s (preset: %s)\n' "${AUDIO_ENHANCE:-on}" "${AUDIO_PRESET:-crystalizer}"
-  printf '  ✓ mpv resampling:   32-point sinc (linear interpolation, zero cutoff)\n'
+  printf '  ✓ audio enhance:    %s (preset: %s)\n' "${AUDIO_ENHANCE:-off}" "${AUDIO_PRESET:-crystalizer}"
+  printf '  ✓ mpv resampling:   32-point filter, gapless\n'
   if command -v ffmpeg >/dev/null 2>&1; then
-    printf '  ✓ audio DSP:        ffmpeg crystalizer (transient dynamic restoration)\n'
+    printf '  ✓ audio DSP:        ffmpeg filters available (crystalizer, limiter, loudnorm)\n'
   fi
   if command -v node >/dev/null 2>&1; then
     printf '  ✓ js runtime:       Node.js (/usr/bin/node) active for yt-dlp\n'
@@ -2734,13 +2754,14 @@ controls_menu() {
       enhance-preset)
         local chosen_preset
         chosen_preset=$(printf '%s\t%s\n' \
-          "crystalizer" "Crystalizer (Dynamic transient clarity & air)" \
+          "crystalizer" "Crystalizer (sharper transients, wider dynamics)" \
           "clarity"     "Clarity / Vocal (Sparkle + vocal presence)" \
           "warm"        "Warm (Crystalizer + rich sub-bass warmth)" \
           "bass"        "Bass Boost (Punchy low end + crystalizer)" \
           "spatial"     "Spatial Widen (Subtle stereo soundstage widening)" \
-          "norm"        "Loudness Normalization (EBU R128 anti-clipping)" \
-          "studio"      "Studio Direct (Pure bit-perfect pass-through)" \
+          "norm"        "Loudness Normalization (EBU R128)" \
+          "studio"      "Studio Direct (no filters)" \
+          "custom"      "Custom (your AUDIO_CUSTOM_AF filter chain)" \
           | fzf --delimiter='\t' --with-nth=2 --prompt="preset > " --height=45% --border --reverse | cut -f1) || true
         if [[ -n "$chosen_preset" ]]; then
           "$SELF" ctl enhance "$chosen_preset" || true
@@ -2796,19 +2817,22 @@ _tunes_completions() {
   prev="${COMP_WORDS[COMP_CWORD-1]}"
   prev2=""; (( COMP_CWORD > 1 )) && prev2="${COMP_WORDS[COMP_CWORD-2]}"
 
-  subcmds="home search bg play video vlc queue add history fav-add favorites fav-remove download lyrics ctl enhance status np notify top mix stats report ask ai config doctor pod pod-add pod-add-url pod-feeds pod-history pod-download pod-remove recommend mood playlist autoplay upnext completion version help"
+  subcmds="home search bg play video vlc queue add history fav-add favorites fav-remove download lyrics ctl enhance status np notify top forgotten mix stats report ask ai config doctor sleep alarm scrobble backup restore update local pod pod-add pod-add-url pod-feeds pod-history pod-download pod-remove recommend mood playlist autoplay upnext completion version help"
 
   if [[ "$prev2" == "config" && ( "$prev" == "set" || "$prev" == "unset" ) ]]; then
-    COMPREPLY=( $(compgen -W "LLM_BACKEND LLM_URL LLM_MODEL LLM_API_KEY LLM_TIMEOUT YT_CLIENT PLAY_THRESHOLD REPORT_REMINDER DEFAULT_VOLUME AUTOPLAY AUDIO_QUALITY AUDIO_ENHANCE AUDIO_PRESET DOWNLOAD_FORMAT" -- "$cur") ); return 0
+    COMPREPLY=( $(compgen -W "LLM_BACKEND LLM_URL LLM_MODEL LLM_API_KEY LLM_TIMEOUT YT_CLIENT PLAY_THRESHOLD REPORT_REMINDER DEFAULT_VOLUME AUTOPLAY AUDIO_QUALITY AUDIO_ENHANCE AUDIO_PRESET AUDIO_CUSTOM_AF REPLAYGAIN DOWNLOAD_FORMAT MUSIC_DIR LISTENBRAINZ_TOKEN LISTENBRAINZ_URL" -- "$cur") ); return 0
   fi
   case "$prev" in
     tunes|-d|-l|-s|--bg|--detach|--loop|--shuffle) COMPREPLY=( $(compgen -W "$subcmds" -- "$cur") ) ;;
     ctl)       COMPREPLY=( $(compgen -W "pause play stop next prev vol vol-up vol-down mute seek speed loop-toggle loop-on loop-off queue jump status enhance" -- "$cur") ) ;;
-    enhance)   COMPREPLY=( $(compgen -W "on off toggle crystalizer clarity warm bass spatial norm studio" -- "$cur") ) ;;
-    playlist)  COMPREPLY=( $(compgen -W "list create add play view remove delete" -- "$cur") ) ;;
+    enhance)   COMPREPLY=( $(compgen -W "on off toggle crystalizer clarity warm bass spatial norm studio custom" -- "$cur") ) ;;
+    playlist)  COMPREPLY=( $(compgen -W "list create add play view remove delete export import" -- "$cur") ) ;;
+    sleep)     COMPREPLY=( $(compgen -W "15m 30m 1h status off" -- "$cur") ) ;;
+    alarm)     COMPREPLY=( $(compgen -W "status off" -- "$cur") ) ;;
+    scrobble)  COMPREPLY=( $(compgen -W "--dry-run --all" -- "$cur") ) ;;
     recommend) COMPREPLY=( $(compgen -W "music podcast" -- "$cur") ) ;;
     stats|top) COMPREPLY=( $(compgen -W "today yesterday week month year all" -- "$cur") ) ;;
-    report)    COMPREPLY=( $(compgen -W "today yesterday week month year all --ai --save --notify --json" -- "$cur") ) ;;
+    report)    COMPREPLY=( $(compgen -W "today yesterday week month year all --ai --save --notify --json --card" -- "$cur") ) ;;
     config)    COMPREPLY=( $(compgen -W "show set unset edit path" -- "$cur") ) ;;
     ai)        COMPREPLY=( $(compgen -W "test setup models" -- "$cur") ) ;;
     autoplay)  COMPREPLY=( $(compgen -W "on off toggle status" -- "$cur") ) ;;
@@ -2835,12 +2859,18 @@ Play
   tunes vlc [query]           Open a stream in VLC (not counted in stats)
   tunes mix [N]               Shuffle mix from your favourites & most-played tracks
   tunes top [period]          Browse & play your most-played tracks
+        -n N                  how many tracks (default 100)
+        --save NAME           save them as a playlist instead of playing
+  tunes forgotten [days]      Tracks you loved once but haven't played in N days (default 90)
+        --min-plays N · --save NAME
+  tunes local [folder]        Browse & play audio files from a folder (default: MUSIC_DIR)
 
 Library
   tunes history               Recently played (replay)
   tunes fav-add / favorites / fav-remove
   tunes playlist {list|create|add|play|view|remove|delete} [name]
                               'add <name> --now' saves the track playing right now
+  tunes playlist export <n> [file.m3u]   |   import <file.m3u|list.txt> [name]
   tunes download [query]      Download a track with tags & cover art (${DOWNLOAD_FORMAT:-best})
   tunes lyrics                Live lyrics via sptlrx (if installed)
 
@@ -2851,6 +2881,7 @@ Your listening
         --save                keep a copy in ~/.local/share/tunes/reports/
         --notify              desktop notification with the headline numbers
         --json                raw numbers
+        --card                short shareable text card
   tunes ask "question"        Ask your local LLM about your listening habits
   periods: today | yesterday | week | month | year | all | 14d | 8w | 2026-10-01 | 2026-09
   A "play" counts after ${PLAY_THRESHOLD}s of listening (or half of a short track).
@@ -2859,7 +2890,7 @@ Playback control & Audio Quality (works from any terminal / keybinding)
   tunes status | np           Current track, stream quality (Opus 48kHz), volume
   tunes enhance [preset|on|off]
                               Real-time audio DSP enhancements
-                              (crystalizer | clarity | warm | bass | spatial | norm | studio)
+                              (crystalizer | clarity | warm | bass | spatial | norm | studio | custom)
   tunes ctl pause|play|stop|next|prev|mute|loop-toggle|enhance
   tunes ctl vol <0-100> | vol-up [n] | vol-down [n] | seek <+/-sec> | speed <rate>
   tunes ctl queue | jump <n>  Show the queue / jump to a queue position
@@ -2867,6 +2898,16 @@ Playback control & Audio Quality (works from any terminal / keybinding)
   tunes autoplay [on|off|toggle|status]
                               Enable/disable Spotify-style "Up Next" auto-queuing
   tunes upnext                Show & interact with the Up Next queue
+
+Timers
+  tunes sleep <30m|1h30m|90s>  Fade out and stop after a while   (sleep status | sleep off)
+  tunes alarm <HH:MM> [playlist|mix]   Start music at a set time (alarm status | alarm off)
+
+Sync & maintenance
+  tunes scrobble [--dry-run]  Send your plays to ListenBrainz (token: tunes config set LISTENBRAINZ_TOKEN …)
+  tunes backup [dir]          Archive play log, favourites, playlists, podcasts (keeps newest 10)
+  tunes restore <archive>     Restore a backup
+  tunes update [--check]      Update this script from GitHub
 
 Podcasts
   tunes pod                   Pick a feed, then an episode (resumes where you left off)
@@ -2896,24 +2937,454 @@ HELPEOF
 cmd_enhance() {
   if [[ $# -eq 0 ]]; then
     echo "✨ Audio Quality & Enhancements:"
-    echo "  Status:   $([ "${AUDIO_ENHANCE:-on}" == "on" ] && echo "Active (Preset: ${AUDIO_PRESET:-crystalizer})" || echo "Disabled (Studio Direct)")"
+    echo "  Status:   $([ "${AUDIO_ENHANCE:-off}" == "on" ] && echo "Active (Preset: ${AUDIO_PRESET:-crystalizer})" || echo "Off (untouched audio)")"
     echo "  Quality:  ${AUDIO_QUALITY:-highest} (Opus 48kHz preferred)"
-    echo "  Output:   32-point sinc resampling, gapless, anti-clipping headroom"
+    echo "  Output:   gapless, 32-point resampler; enhancement presets end in a peak limiter"
     echo
     echo "Presets:"
-    echo "  crystalizer — Dynamic high-frequency transient clarity & harmonic restoration"
+    echo "  crystalizer — Sharpens transients / widens dynamics (can sound harsh on loud masters)"
     echo "  clarity     — Vocal presence & high-frequency sparkle"
     echo "  warm        — Crystalizer clarity + rich sub-bass warmth"
     echo "  bass        — Heavy low-end boost + crystalizer transient clarity"
     echo "  spatial     — Stereo soundstage widening + crystalizer"
     echo "  norm        — EBU R128 loudness normalization (prevents loudness jumps)"
-    echo "  studio      — Pure bit-perfect pass-through (no DSP filters)"
+    echo "  studio      — Pass-through: no filters applied"
+    echo "  custom      — Your own filter chain: tunes config set AUDIO_CUSTOM_AF '<filters>'"
     echo
     echo "Usage: tunes enhance [preset|on|off|toggle]"
     echo "       tunes config set AUDIO_PRESET <preset>"
     return 0
   fi
   cmd_ctl enhance "$@"
+}
+
+# ---------- timers: sleep & alarm ----------
+
+SLEEP_PID_FILE="$RUNTIME_BASE/tunes-sleep-${UID:-$(id -u)}.pid"   # "<pid> <end-epoch>"
+ALARM_PID_FILE="$RUNTIME_BASE/tunes-alarm-${UID:-$(id -u)}.pid"
+
+# parse_duration 45 | 45m | 1h30m | 90s  ->  seconds (a bare number means minutes)
+parse_duration() {
+  local s="${1,,}" total=0 num unit
+  [[ -n "$s" ]] || return 1
+  if [[ "$s" =~ ^[0-9]+$ ]]; then total=$((10#$s * 60)); ((total > 0)) || return 1; echo "$total"; return 0; fi
+  [[ "$s" =~ ^([0-9]+[hms])+$ ]] || return 1
+  while [[ -n "$s" ]]; do
+    [[ "$s" =~ ^([0-9]+)([hms])(.*)$ ]] || return 1
+    num="${BASH_REMATCH[1]}"; unit="${BASH_REMATCH[2]}"; s="${BASH_REMATCH[3]}"
+    case "$unit" in
+      h) total=$((total + 10#$num * 3600)) ;;
+      m) total=$((total + 10#$num * 60)) ;;
+      s) total=$((total + 10#$num)) ;;
+    esac
+  done
+  ((total > 0)) || return 1
+  echo "$total"
+}
+
+fmt_secs() {
+  local s="$1"
+  if ((s >= 3600)); then printf '%dh %02dm' $((s / 3600)) $((s % 3600 / 60))
+  elif ((s >= 60)); then printf '%dm %02ds' $((s / 60)) $((s % 60))
+  else printf '%ds' "$s"; fi
+}
+
+# live_timer <pidfile> -> prints "<pid> <end-epoch>" when that helper is still running
+live_timer() {
+  local f="$1" pid="" end=""
+  [[ -f "$f" ]] || return 1
+  read -r pid end < "$f" || true
+  if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+    printf '%s %s' "$pid" "${end:-0}"
+    return 0
+  fi
+  rm -f "$f"
+  return 1
+}
+
+cancel_timer() {
+  local f="$1" info pid
+  info=$(live_timer "$f") || return 1
+  pid="${info%% *}"
+  pkill -P "$pid" 2>/dev/null || true
+  kill "$pid" 2>/dev/null || true
+  rm -f "$f"
+  return 0
+}
+
+start_timer() {   # start_timer <pidfile> <secs> <internal-command> [args...]
+  local f="$1" secs="$2" pid; shift 2
+  cancel_timer "$f" || true
+  nohup bash "$SELF" "$@" </dev/null >/dev/null 2>&1 &
+  pid=$!
+  disown "$pid"
+  printf '%s %s\n' "$pid" "$(( $(date +%s) + secs ))" > "$f"
+}
+
+# Internal: fades the volume out over the last seconds, then stops playback.
+__sleep_run() {
+  local secs="$1" fade=15 vol i
+  if ((secs > fade)); then sleep $((secs - fade)); else fade="$secs"; fi
+  if mpv_ipc '["get_property","pid"]' 0 >/dev/null 2>&1; then
+    vol=$(mpv_ipc '["get_property","volume"]' 1 2>/dev/null || echo 100)
+    vol="${vol%.*}"; [[ "$vol" =~ ^[0-9]+$ ]] || vol=100
+    for ((i = fade - 1; i >= 0; i--)); do
+      mpv_ipc "[\"set_property\",\"volume\",$((vol * i / fade))]" 0 >/dev/null 2>&1 || break
+      sleep 1
+    done
+    mpv_ipc '["quit"]' 0 >/dev/null 2>&1 || true
+    rm -f "$MPV_SOCKET"
+    desktop_notify "Tunes" "Sleep timer: playback stopped" "media-playback-stop"
+  fi
+  rm -f "$SLEEP_PID_FILE"
+}
+
+# tunes sleep <30m|1h30m|90s|45> | status | off
+cmd_sleep() {
+  local arg="${1:-status}" info secs
+  case "$arg" in
+    status)
+      if info=$(live_timer "$SLEEP_PID_FILE"); then
+        secs=$(( ${info#* } - $(date +%s) )); ((secs < 0)) && secs=0
+        echo "😴 Sleep timer: playback stops in $(fmt_secs "$secs")   (cancel: tunes sleep off)"
+      else
+        echo "No sleep timer set.   Usage: tunes sleep 30m"
+      fi ;;
+    off|cancel|stop)
+      if cancel_timer "$SLEEP_PID_FILE"; then echo "✔ Sleep timer cancelled"; else echo "No sleep timer set."; fi ;;
+    *)
+      secs=$(parse_duration "$arg") || { echo "Usage: tunes sleep <30m | 1h30m | 90s | 45 (minutes)> | status | off" >&2; return 1; }
+      start_timer "$SLEEP_PID_FILE" "$secs" __sleep_run "$secs"
+      echo "😴 Sleep timer set: music fades out and stops in $(fmt_secs "$secs")" ;;
+  esac
+}
+
+# Internal: waits, then starts the alarm playlist (or your mix) in the background.
+__alarm_run() {
+  local secs="$1" what="${2:-}"
+  sleep "$secs"
+  rm -f "$ALARM_PID_FILE"
+  desktop_notify "Tunes" "⏰ Good morning — starting your music" "alarm-clock"
+  if [[ -n "$what" && "$what" != "mix" ]]; then bash "$SELF" -d playlist play "$what" || true
+  else bash "$SELF" -d mix || true; fi
+}
+
+# tunes alarm <HH:MM> [playlist|mix] | status | off
+cmd_alarm() {
+  local arg="${1:-status}" what="${2:-mix}" info secs now target
+  case "$arg" in
+    status)
+      if info=$(live_timer "$ALARM_PID_FILE"); then
+        secs=$(( ${info#* } - $(date +%s) )); ((secs < 0)) && secs=0
+        echo "⏰ Alarm rings in $(fmt_secs "$secs")   (cancel: tunes alarm off)"
+      else
+        echo "No alarm set.   Usage: tunes alarm 07:30 [playlist]"
+      fi ;;
+    off|cancel|stop)
+      if cancel_timer "$ALARM_PID_FILE"; then echo "✔ Alarm cancelled"; else echo "No alarm set."; fi ;;
+    *)
+      if ! [[ "$arg" =~ ^([01]?[0-9]|2[0-3]):[0-5][0-9]$ ]]; then
+        echo "Usage: tunes alarm <HH:MM> [playlist|mix] | status | off" >&2; return 1
+      fi
+      if [[ "$what" != "mix" && ! -s "$(playlist_path "$what")" ]]; then
+        echo "Playlist '$what' not found or empty (use a playlist name, or 'mix')." >&2; return 1
+      fi
+      now=$(date +%s)
+      target=$(date -d "$arg" +%s 2>/dev/null) || { echo "Could not understand the time '$arg'." >&2; return 1; }
+      ((target > now)) || target=$(date -d "tomorrow $arg" +%s)
+      secs=$((target - now))
+      start_timer "$ALARM_PID_FILE" "$secs" __alarm_run "$secs" "$what"
+      echo "⏰ Alarm set for $(date -d "@$target" '+%a %H:%M') ($(fmt_secs "$secs") from now) → ${what}"
+      echo "   (keep this machine awake until then; it only runs while your session is up)" ;;
+  esac
+}
+
+# ---------- smart playlists from your stats ----------
+
+# save_rows_as_playlist <name> <tsv rows: title \t url ...>
+save_rows_as_playlist() {
+  local name pl_file n=0 title url rest
+  name=$(sanitize_name "$1")
+  [[ -n "$name" ]] || { echo "Playlist name is empty." >&2; return 1; }
+  pl_file=$(playlist_path "$name"); touch "$pl_file"
+  while IFS=$'\t' read -r title url rest; do
+    [[ -n "$url" ]] || continue
+    dedupe_tsv_by_url "$pl_file" "$url"
+    printf '%s\t%s\n' "$(sanitize_field "$title")" "$url" >> "$pl_file"
+    n=$((n + 1))
+  done <<< "$2"
+  echo "✔ Saved $n tracks to playlist '$name'   (play it: tunes playlist play \"$name\")"
+}
+
+# play_stats_rows <queue label> <fzf prompt> <rows from stats_engine top>
+play_stats_rows() {
+  local label="$1" prompt="$2" rows="$3" selections
+  selections=$(printf '%s\n' "$rows" | fzf --multi --delimiter='\t' --with-nth=1,3,4 \
+      --prompt="$prompt" --header="TAB: select several · ENTER: play · ?: details" \
+      --height=70% --border --reverse \
+      --preview='echo -e "Title:   \033[1m{1}\033[0m\nArtist:  {3}\nPlays:   {4}\nURL:     {2}"' \
+      --preview-window="down:4:wrap:hidden" --bind="?:toggle-preview") || exit 0
+  [[ -z "$selections" ]] && exit 0
+  play_queue "$label" "$selections"
+}
+
+# tunes forgotten [days] [--min-plays N] [--save NAME]
+#   tracks you played a lot once, but not in the last N days (default 90)
+cmd_forgotten() {
+  local days=90 min=3 save="" all recent rows
+  while (($#)); do
+    case "$1" in
+      --save) save="${2:-}"; [[ -n "$save" ]] || { echo "Usage: tunes forgotten [days] [--min-plays N] [--save NAME]" >&2; return 1; }; shift 2 ;;
+      --min-plays) min="${2:-}"; [[ "$min" =~ ^[0-9]+$ ]] || { echo "--min-plays needs a number" >&2; return 1; }; shift 2 ;;
+      *) if [[ "${1%d}" =~ ^[0-9]+$ ]] && ((10#${1%d} > 0)); then days="${1%d}"; shift
+         else echo "Usage: tunes forgotten [days] [--min-plays N] [--save NAME]" >&2; return 1; fi ;;
+    esac
+  done
+  all=$(stats_engine top --period all --limit 100000)
+  recent=$(stats_engine top --period "${days}d" --limit 100000 | cut -f2)
+  rows=$(awk -F'\t' -v min="$min" '
+    NR == FNR { seen[$0] = 1; next }
+    !($2 in seen) { n = $4; sub(/^×/, "", n); sub(/ .*/, "", n); if (n + 0 >= min) print }
+  ' <(printf '%s\n' "$recent") <(printf '%s\n' "$all"))
+  if [[ -z "$rows" ]]; then
+    echo "Nothing forgotten: no track with ≥$min plays has been missing for $days days."; return 0
+  fi
+  if [[ -n "$save" ]]; then save_rows_as_playlist "$save" "$(cut -f1,2 <<<"$rows")"; return 0; fi
+  play_stats_rows "Forgotten favourites (>${days}d)" "💤 forgotten (>${days}d) > " "$rows"
+}
+
+# ---------- playlist import / export (M3U) ----------
+
+playlist_export() {
+  local name="${1:-}" out="${2:-}" pl_file title url
+  [[ -z "$name" ]] && { name=$(pick_playlist) || exit 0; }
+  pl_file=$(playlist_path "$name")
+  [[ -s "$pl_file" ]] || { echo "Playlist '$name' is empty or does not exist."; exit 1; }
+  [[ -z "$out" ]] && out="./$(sanitize_name "$name").m3u"
+  {
+    printf '#EXTM3U\n'
+    while IFS=$'\t' read -r title url _; do
+      [[ -n "$url" ]] || continue
+      printf '#EXTINF:-1,%s\n%s\n' "$title" "$url"
+    done < "$pl_file"
+  } > "$out"
+  echo "✔ Exported $(grep -c '^#EXTINF' "$out") tracks to $out"
+}
+
+# Reads .m3u / .m3u8 (with or without #EXTINF titles) or a plain list of URLs, one per line.
+playlist_import() {
+  local src="${1:-}" name="${2:-}" pl_file line pending="" url title n=0 base
+  [[ -f "$src" ]] || { echo "Usage: tunes playlist import <file.m3u|file.m3u8|list.txt> [name]" >&2; exit 1; }
+  [[ -z "$name" ]] && name=$(basename "${src%.*}")
+  name=$(sanitize_name "$name"); [[ -n "$name" ]] || exit 1
+  pl_file=$(playlist_path "$name"); touch "$pl_file"
+  base="$(cd "$(dirname "$src")" && pwd)"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "${line// }" ]] && continue
+    if [[ "$line" == '#EXTINF:'* ]]; then pending="${line#*,}"; continue; fi
+    [[ "$line" == '#'* ]] && continue
+    url="$line"
+    if [[ ! "$url" =~ ^[A-Za-z][A-Za-z0-9+.-]*:// && "$url" != /* ]]; then url="$base/$url"; fi
+    title="${pending:-$(basename "${url%%\?*}")}"; pending=""
+    dedupe_tsv_by_url "$pl_file" "$url"
+    printf '%s\t%s\n' "$(sanitize_field "$title")" "$url" >> "$pl_file"
+    n=$((n + 1))
+  done < "$src"
+  echo "✔ Imported $n tracks into playlist '$name'"
+}
+
+# ---------- ListenBrainz scrobbling ----------
+
+SCROBBLE_PY=$(cat <<'PYEOF'
+import sys, json, os, re
+path, cursor = sys.argv[1], int(sys.argv[2])
+thresh = float(os.environ.get('TUNES_THRESH', '30'))
+BATCH = 100
+rows = []
+try:
+    f = open(path, encoding='utf-8', errors='replace')
+except OSError:
+    sys.exit(0)
+with f:
+    for line in f:
+        p = line.rstrip('\n').split('\t')
+        if len(p) < 7:
+            continue
+        try:
+            ts, listened, dur = int(float(p[0])), float(p[2]), float(p[3] or 0)
+        except ValueError:
+            continue
+        if (p[1] or 'music') != 'music' or ts <= cursor:
+            continue
+        need = min(thresh, dur * 0.5) if dur > 0 else thresh      # same rule as the stats engine
+        title = p[4].strip()
+        artist = re.sub(r'\s*-\s*Topic$', '', p[5].strip())
+        if listened < need or not title or not artist:
+            continue
+        info = {'media_player': 'tunes', 'submission_client': 'tunes',
+                'submission_client_version': os.environ.get('TUNES_VERSION', '')}
+        if re.match(r'^https?://', p[6]):
+            info['origin_url'] = p[6]
+        if dur > 0:
+            info['duration'] = int(dur)
+        rows.append((ts, {'listened_at': ts, 'track_metadata': {
+            'artist_name': artist, 'track_name': title, 'additional_info': info}}))
+rows.sort(key=lambda r: r[0])
+for i in range(0, len(rows), BATCH):
+    chunk = rows[i:i + BATCH]
+    payload = json.dumps({'listen_type': 'import', 'payload': [c[1] for c in chunk]}, ensure_ascii=False)
+    print('%d\t%d\t%s' % (len(chunk), chunk[-1][0], payload))
+PYEOF
+)
+
+# tunes scrobble [--dry-run] [--all]
+cmd_scrobble() {
+  local dry=0 resend=0 a
+  for a in "$@"; do
+    case "$a" in
+      -n|--dry-run) dry=1 ;;
+      --all) resend=1 ;;
+      *) echo "Usage: tunes scrobble [--dry-run] [--all]   (--all re-sends your whole history)" >&2; return 1 ;;
+    esac
+  done
+  if ((dry == 0)) && [[ -z "$LISTENBRAINZ_TOKEN" ]]; then
+    echo "No ListenBrainz token yet. Copy yours from https://listenbrainz.org/settings/ then run:" >&2
+    echo "  tunes config set LISTENBRAINZ_TOKEN <token>" >&2
+    return 1
+  fi
+  local cursor_file="$DATA_DIR/.listenbrainz_cursor" cursor=0 batches count max_ts payload sent=0 url errf
+  if ((resend == 0)) && [[ -f "$cursor_file" ]]; then cursor=$(cat "$cursor_file" 2>/dev/null || echo 0); fi
+  [[ "$cursor" =~ ^[0-9]+$ ]] || cursor=0
+  batches=$(TUNES_THRESH="$PLAY_THRESHOLD" TUNES_VERSION="$TUNES_VERSION" python3 -c "$SCROBBLE_PY" "$PLAYS_FILE" "$cursor")
+  if [[ -z "$batches" ]]; then echo "Nothing new to submit."; return 0; fi
+  url="${LISTENBRAINZ_URL%/}/1/submit-listens"
+  errf=$(mktemp)
+  while IFS=$'\t' read -r count max_ts payload; do
+    if ((dry)); then sent=$((sent + count)); continue; fi
+    if ! curl -fsS --max-time 30 -o /dev/null -X POST "$url" \
+         -H "Authorization: Token $LISTENBRAINZ_TOKEN" -H "Content-Type: application/json" \
+         --data-binary "$payload" 2>"$errf"; then
+      echo "✗ ListenBrainz rejected the submission: $(tr '\n' ' ' < "$errf") — check your token (tunes config)." >&2
+      rm -f "$errf"
+      return 1
+    fi
+    printf '%s\n' "$max_ts" > "$cursor_file"
+    sent=$((sent + count))
+  done <<< "$batches"
+  rm -f "$errf"
+  if ((dry)); then echo "Dry run: $sent listens would be submitted (nothing sent)."
+  else echo "✔ Submitted $sent listens to ListenBrainz"; fi
+}
+
+# ---------- backup / restore ----------
+
+# tunes backup [dir]  — play log, history, favourites, playlists, podcasts, reports (no API keys)
+cmd_backup() {
+  local dest="${1:-$DATA_DIR/backups}" keep=10 out items=() f old
+  mkdir -p "$dest"
+  for f in plays.tsv history.tsv favorites.tsv feeds.tsv podcast_history.tsv playlists reports; do
+    [[ -e "$DATA_DIR/$f" ]] && items+=("$f")
+  done
+  ((${#items[@]})) || { echo "Nothing to back up yet."; return 0; }
+  out="$dest/tunes-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+  tar -C "$DATA_DIR" -czf "$out" "${items[@]}"
+  echo "✔ Backup saved: $out ($(du -h "$out" | cut -f1))"
+  local i=0
+  while IFS= read -r old; do
+    i=$((i + 1))
+    ((i > keep)) && rm -f "$old"
+  done < <(ls -1t "$dest"/tunes-backup-*.tar.gz 2>/dev/null || true)
+  echo "   Keeping the newest $keep backups. Settings/API keys are not included."
+}
+
+# tunes restore <archive> [-y]  — extracts over your data (refuses unsafe paths)
+cmd_restore() {
+  local arc="${1:-}" yes="${2:-}" entry ans
+  [[ -f "$arc" ]] || { echo "Usage: tunes restore <backup.tar.gz> [-y]" >&2; return 1; }
+  while IFS= read -r entry; do
+    if [[ "$entry" == /* || "/$entry/" == */../* ]]; then echo "Refusing: archive contains an unsafe path ($entry)." >&2; return 1; fi
+  done < <(tar -tzf "$arc")
+  if [[ "$yes" != "-y" ]]; then
+    read -rp "Restore $arc over the data in $DATA_DIR? [y/N] " ans || true
+    [[ "$ans" =~ ^[Yy]$ ]] || { echo "Cancelled."; return 0; }
+  fi
+  mkdir -p "$DATA_DIR"
+  tar -C "$DATA_DIR" -xzf "$arc"
+  echo "✔ Restored from $arc"
+}
+
+# ---------- self-update ----------
+
+# tunes update [--check] [-y]
+cmd_update() {
+  local check=0 yes=0 a url tmp remote
+  for a in "$@"; do
+    case "$a" in --check) check=1 ;; -y|--yes) yes=1 ;; *) echo "Usage: tunes update [--check] [-y]" >&2; return 1 ;; esac
+  done
+  require curl
+  url="${TUNES_UPDATE_URL:-https://raw.githubusercontent.com/MelancholicMuser/tunes/main/tunes}"
+  tmp=$(mktemp "${TMPDIR:-/tmp}/tunes-update-XXXXXX")
+  if ! curl -fsSL --max-time 30 -o "$tmp" "$url"; then
+    rm -f "$tmp"; echo "Could not download $url" >&2; return 1
+  fi
+  remote=$(grep -m1 '^TUNES_VERSION=' "$tmp" | cut -d'"' -f2 || true)
+  if [[ "$(head -n1 "$tmp")" != '#!/usr/bin/env bash' ]] || ! [[ "$remote" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || ! bash -n "$tmp" 2>/dev/null; then
+    rm -f "$tmp"; echo "The downloaded file does not look like a valid tunes script — not touching your install." >&2; return 1
+  fi
+  if [[ "$remote" == "$TUNES_VERSION" ]]; then rm -f "$tmp"; echo "✔ tunes $TUNES_VERSION is up to date."; return 0; fi
+  if [[ "$(printf '%s\n%s\n' "$remote" "$TUNES_VERSION" | sort -V | tail -n1)" == "$TUNES_VERSION" ]]; then
+    rm -f "$tmp"; echo "Your version ($TUNES_VERSION) is newer than the published one ($remote)."; return 0
+  fi
+  echo "Update available: $TUNES_VERSION → $remote"
+  if ((check)); then rm -f "$tmp"; echo "Run: tunes update"; return 0; fi
+  if [[ ! -w "$SELF" || ! -w "$(dirname "$SELF")" ]]; then
+    rm -f "$tmp"; echo "Cannot write to $SELF — re-run with the right permissions, or reinstall with ./install.sh" >&2; return 1
+  fi
+  if ((yes == 0)); then
+    read -rp "Install $remote to $SELF (a copy of the current one is kept as $SELF.bak)? [y/N] " a || true
+    [[ "$a" =~ ^[Yy]$ ]] || { rm -f "$tmp"; echo "Cancelled."; return 0; }
+  fi
+  cp "$SELF" "$SELF.bak"
+  install -m 755 "$tmp" "$SELF.new" && mv "$SELF.new" "$SELF"
+  rm -f "$tmp"
+  echo "✔ Updated to $remote  (previous version: $SELF.bak)"
+}
+
+# ---------- local library ----------
+
+# tunes local [folder]  — browse and play audio files from a folder (default: $MUSIC_DIR)
+cmd_local() {
+  local dir="${1:-$MUSIC_DIR}" files rows f selections
+  [[ -d "$dir" ]] || { echo "Not a folder: $dir   (set yours with: tunes config set MUSIC_DIR ~/Music)" >&2; return 1; }
+  files=$(find "$dir" -type f \( -iname '*.mp3' -o -iname '*.flac' -o -iname '*.opus' -o -iname '*.ogg' \
+            -o -iname '*.m4a' -o -iname '*.aac' -o -iname '*.wav' -o -iname '*.wma' \) 2>/dev/null \
+          | grep -v $'\t' | sort || true)
+  [[ -n "$files" ]] || { echo "No audio files found in $dir"; return 0; }
+  rows=$(while IFS= read -r f; do printf '%s\t%s\n' "$(basename "${f%.*}")" "$f"; done <<<"$files")
+  selections=$(printf '%s\n' "$rows" | fzf --multi --delimiter='\t' --with-nth=1 \
+      --prompt="📁 local > " --header="TAB: select several · ENTER: play" \
+      --height=70% --border --reverse) || exit 0
+  [[ -z "$selections" ]] && exit 0
+  play_queue "Local music" "$selections"
+}
+
+# ---------- shareable report card ----------
+
+# report_card <period>  — a short plain-text summary you can paste anywhere
+report_card() {
+  local period="$1" d
+  require jq
+  d=$(stats_engine json --period "$period")
+  if [[ "$(jq -r '.plays' <<<"$d")" == 0 ]]; then echo "No plays logged for '$period' yet."; return 0; fi
+  jq -r '
+    def clock: (. / 60 | floor) as $m | if $m >= 60 then "\(($m / 60 | floor))h \($m % 60)m" else "\($m)m" end;
+    "🎧 My listening · \(.label)",
+    "▸ \(.plays) plays · \(.secs | clock) · \(.unique_tracks) tracks · \(.unique_artists) artists",
+    (if (.top_tracks | length) > 0 then "▸ Top track: \(.top_tracks[0].title)\(if .top_tracks[0].artist != "" then " — \(.top_tracks[0].artist)" else "" end) (×\(.top_tracks[0].plays))" else empty end),
+    (if (.top_artists | length) > 0 then "▸ Top artist: \(.top_artists[0].artist) (×\(.top_artists[0].plays))" else empty end),
+    (if (.streak_current // 0) > 1 then "▸ Streak: \(.streak_current) days" else empty end),
+    "#tunes"' <<<"$d"
 }
 
 # ---------- dispatch ----------
@@ -2942,7 +3413,11 @@ cmd="${1:-home}"; shift || true
 case "$cmd" in
   help|version|completion|doctor|config|ai) ;;
   stats|report|ask) require python3; init_state ;;
-  ctl|status|np|notify|enhance) require python3 ;;
+  ctl|status|np|notify|enhance|sleep|alarm|__sleep_run|__alarm_run) require python3 ;;
+  scrobble) require python3 curl; init_state ;;
+  backup|restore) init_state ;;
+  update) ;;
+  local) require mpv fzf python3; init_state ;;
   *) require mpv yt-dlp fzf python3 curl jq; init_state ;;
 esac
 
@@ -2975,7 +3450,17 @@ case "$cmd" in
   pod-download)    cmd_podcast_download ;;
   recommend)       cmd_recommend "${1:-}" ;;
   mood)            cmd_mood "$*" ;;
-  top)             cmd_top "${1:-all}" ;;
+  top)             cmd_top "$@" ;;
+  forgotten)       cmd_forgotten "$@" ;;
+  sleep)           cmd_sleep "${1:-status}" ;;
+  alarm)           cmd_alarm "$@" ;;
+  scrobble)        cmd_scrobble "$@" ;;
+  backup)          cmd_backup "${1:-}" ;;
+  restore)         cmd_restore "${1:-}" "${2:-}" ;;
+  update)          cmd_update "$@" ;;
+  local)           cmd_local "${1:-}" ;;
+  __sleep_run)     __sleep_run "${1:-0}" ;;
+  __alarm_run)     __alarm_run "${1:-0}" "${2:-}" ;;
   mix)             cmd_mix "${1:-25}" ;;
   stats)           cmd_stats "$@" ;;
   report)          cmd_report "$@" ;;

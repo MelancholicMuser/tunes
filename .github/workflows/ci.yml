@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mpv fzf jq shellcheck python3 curl util-linux
+
+      - name: Syntax check
+        run: |
+          bash -n tunes
+          bash -n install.sh
+          bash -n tests/run.sh
+
+      - name: Lint (shellcheck, warnings and above)
+        run: shellcheck -S warning tunes install.sh tests/run.sh
+
+      - name: Integration tests
+        run: tests/run.sh

@@ -263,5 +263,262 @@ out=$(tunes recommend podcast 2>&1); assert_contains "recommend podcast with no 
 rm -f "$T/data/history.tsv"; : > "$T/data/history.tsv"
 out=$(tunes history 2>&1); assert_contains "empty history is graceful" "$out" "No history"
 
+# ================================================================= v2.1 / v2.2 features
+tunes_in() { local d="$1"; shift; TUNES_DATA_DIR="$d" bash "$TUNES" "$@"; }
+bg_play() { tunes -d play "$T/media/long.wav" >/dev/null 2>&1; wait_for bash -c "bash '$TUNES' status | grep -q Playing"; sleep 1.5; }
+is_idle() { local o; o=$(bash "$TUNES" status 2>/dev/null); [[ "$o" != *Playing* ]]; }   # no `grep -q` pipe: SIGPIPE + pipefail gives false results
+stop_all() { tunes ctl stop >/dev/null 2>&1; sleep 0.6; }
+
+section "Autoplay & Up Next (v2.1)"
+tunes autoplay on >/dev/null 2>&1
+assert_contains "autoplay status says ON" "$(tunes autoplay status)" "ON"
+tunes autoplay off >/dev/null 2>&1
+assert_contains "autoplay off is remembered" "$(tunes autoplay status)" "OFF"
+tunes autoplay toggle >/dev/null 2>&1
+assert_contains "autoplay toggle turns it back on" "$(tunes autoplay status)" "ON"
+out=$(tunes autoplay bogus 2>&1); rc=$?; check "autoplay rejects unknown argument" test $rc -ne 0
+assert_contains "upnext with nothing playing says so" "$(tunes upnext 2>&1)" "Nothing is playing"
+
+section "Audio enhancement (opt-in, safe filter chains)"
+assert_contains "enhancement is off by default" "$(tunes enhance)" "Off (untouched audio)"
+for p in crystalizer clarity warm bass spatial norm; do
+  AUDIO_ENHANCE=on AUDIO_PRESET=$p bg_play
+  st=$(tunes status 2>&1)
+  if contains "$st" "Active ("; then ok "preset '$p' is accepted by mpv and shows as active"; else bad "preset '$p' is accepted by mpv and shows as active" "$st"; fi
+  [[ $p == crystalizer ]] && assert_contains "crystalizer chain ends in a limiter" "$st" "alimiter"
+  stop_all
+done
+AUDIO_ENHANCE=on AUDIO_PRESET=studio bg_play
+assert_contains "studio preset applies no filters" "$(tunes status 2>&1)" "Off (no filters)"
+stop_all
+AUDIO_ENHANCE=on AUDIO_PRESET=custom AUDIO_CUSTOM_AF='equalizer=f=100:t=q:w=1:g=3' bg_play
+assert_contains "custom preset uses your own filter chain" "$(tunes status 2>&1)" "equalizer"
+stop_all
+REPLAYGAIN=track bg_play
+assert_contains "REPLAYGAIN=track is accepted by mpv" "$(tunes status 2>&1)" "Playing"
+stop_all
+out=$(tunes ctl enhance on 2>&1); assert_contains "ctl enhance with nothing playing says so" "$out" "Nothing is playing"
+out=$(tunes config set AUDIO_PRESET nonsense 2>&1); rc=$?; check "invalid AUDIO_PRESET rejected" test $rc -ne 0
+out=$(tunes config set REPLAYGAIN loud 2>&1); rc=$?; check "invalid REPLAYGAIN rejected" test $rc -ne 0
+out=$(tunes config set AUDIO_CUSTOM_AF 'bad"quote' 2>&1); rc=$?; check "AUDIO_CUSTOM_AF with a quote rejected" test $rc -ne 0
+out=$(tunes config set AUDIO_CUSTOM_AF 'back\slash' 2>&1); rc=$?; check "AUDIO_CUSTOM_AF with a backslash rejected" test $rc -ne 0
+check "valid AUDIO_CUSTOM_AF accepted" tunes config set AUDIO_CUSTOM_AF 'equalizer=f=100:t=q:w=1:g=3'
+tunes config unset AUDIO_CUSTOM_AF >/dev/null 2>&1
+
+section "Sleep timer"
+out=$(tunes sleep status 2>&1);      assert_contains "no timer by default" "$out" "No sleep timer"
+out=$(tunes sleep banana 2>&1); rc=$?; check "garbage duration rejected" test $rc -ne 0
+out=$(tunes sleep 0 2>&1); rc=$?;      check "zero duration rejected" test $rc -ne 0
+bg_play
+out=$(tunes sleep 1h30m 2>&1);       assert_contains "sleep 1h30m is accepted" "$out" "1h 30m"
+assert_contains "status shows the countdown" "$(tunes sleep status)" "stops in"
+assert_contains "…and playback is still going" "$(tunes status)" "Playing"
+out=$(tunes sleep off 2>&1);         assert_contains "sleep off cancels" "$out" "cancelled"
+assert_contains "…and status agrees" "$(tunes sleep status)" "No sleep timer"
+out=$(tunes sleep 90 2>&1);           assert_contains "bare number means minutes (90 → 1h 30m)" "$out" "1h 30m"
+tunes sleep off >/dev/null 2>&1
+tunes sleep 3s >/dev/null 2>&1
+if wait_for is_idle; then ok "short timer fades out and stops playback"; else bad "short timer fades out and stops playback" "$(tunes status)"; fi
+assert_contains "…and clears itself afterwards" "$(tunes sleep status)" "No sleep timer"
+stop_all
+
+section "Alarm"
+out=$(tunes alarm 25:99 2>&1); rc=$?;            check "invalid time rejected" test $rc -ne 0
+out=$(tunes alarm 07:30 nosuchlist 2>&1); rc=$?;  check "unknown playlist rejected" test $rc -ne 0
+printf 'Song A\t%s\nSong B\t%s\n' "$T/media/songA.wav" "$T/media/songB.wav" > "$T/data/playlists/AlarmList.tsv"
+out=$(tunes alarm 07:30 AlarmList 2>&1);          assert_contains "alarm is armed" "$out" "Alarm set"
+assert_contains "status shows the countdown" "$(tunes alarm status)" "rings in"
+out=$(tunes alarm off 2>&1);                      assert_contains "alarm off cancels" "$out" "cancelled"
+assert_contains "…and status agrees" "$(tunes alarm status)" "No alarm set"
+bash "$TUNES" __alarm_run 1 AlarmList >/dev/null 2>&1
+if wait_for bash -c "bash '$TUNES' status | grep -q Playing"; then ok "alarm starts the playlist when it rings"; else bad "alarm starts the playlist when it rings"; fi
+assert_contains "…and it is the alarm playlist" "$(tunes ctl queue)" "Song A"
+stop_all
+
+section "Smart playlists from stats (top --save, forgotten)"
+SD="$T/smart"; mkdir -p "$SD"
+now=$(date +%s); old=$((now - 120 * 86400))
+{
+  for i in 1 2 3 4 5; do printf '%s\tmusic\t200\t210\tOld Fave\tArtist O\t%s\n' $((old + i * 60)) "$T/media/songA.wav"; done
+  for i in 1 2 3 4 5; do printf '%s\tmusic\t200\t210\tRecent Hit\tArtist R\t%s\n' $((now - i * 3600)) "$T/media/songB.wav"; done
+  printf '%s\tmusic\t200\t210\tRare\tArtist X\t%s\n' $((old + 9000)) "$T/media/rare.wav"
+} > "$SD/plays.tsv"
+out=$(tunes_in "$SD" top all --save Favs 2>&1);     assert_contains "top --save reports what it saved" "$out" "Saved 3 tracks"
+check "playlist file has 3 tracks" test "$(grep -c . "$SD/playlists/Favs.tsv")" -eq 3
+tunes_in "$SD" top all --save Favs >/dev/null 2>&1
+check "saving again does not duplicate tracks" test "$(grep -c . "$SD/playlists/Favs.tsv")" -eq 3
+tunes_in "$SD" top week --save W >/dev/null 2>&1
+check "period filter applies (only the recent track)" test "$(grep -c . "$SD/playlists/W.tsv")" -eq 1
+assert_contains "…and it is the right one" "$(cat "$SD/playlists/W.tsv")" "Recent Hit"
+tunes_in "$SD" top all -n 1 --save One >/dev/null 2>&1
+check "-n limits the number of tracks" test "$(grep -c . "$SD/playlists/One.tsv")" -eq 1
+out=$(tunes_in "$SD" top --save 2>&1); rc=$?;       check "top --save without a name is rejected" test $rc -ne 0
+out=$(tunes_in "$SD" top -n abc 2>&1); rc=$?;       check "top -n abc is rejected" test $rc -ne 0
+tunes_in "$SD" forgotten --save F >/dev/null 2>&1
+check "forgotten: only the long-missing favourite" test "$(grep -c . "$SD/playlists/F.tsv")" -eq 1
+assert_contains "…it is the old favourite" "$(cat "$SD/playlists/F.tsv")" "Old Fave"
+tunes_in "$SD" forgotten 30 --min-plays 1 --save F2 >/dev/null 2>&1
+check "forgotten --min-plays 1 also finds the rare track" test "$(grep -c . "$SD/playlists/F2.tsv")" -eq 2
+assert_not_contains "…but never the track played recently" "$(cat "$SD/playlists/F2.tsv")" "Recent Hit"
+out=$(tunes_in "$SD" forgotten 500 2>&1);           assert_contains "nothing forgotten within 500 days" "$out" "Nothing forgotten"
+out=$(tunes_in "$SD" forgotten banana 2>&1); rc=$?; check "forgotten rejects a bad argument" test $rc -ne 0
+
+section "Playlist import / export (M3U)"
+tunes playlist export Mine "$T/out.m3u" >/dev/null 2>&1
+m3u=$(cat "$T/out.m3u" 2>/dev/null)
+assert_contains "export writes an extended M3U" "$m3u" "#EXTM3U"
+assert_contains "…with titles" "$m3u" "#EXTINF:-1,Song A"
+assert_contains "…and locations" "$m3u" "$T/media/songA.wav"
+out=$(tunes playlist import "$T/out.m3u" Copy 2>&1); assert_contains "import reports the count" "$out" "Imported 2 tracks"
+assert_contains "titles survive the round trip" "$(cat "$T/data/playlists/Copy.tsv")" "Song B"
+tunes playlist import "$T/out.m3u" Copy >/dev/null 2>&1
+check "importing twice does not duplicate" test "$(grep -c . "$T/data/playlists/Copy.tsv")" -eq 2
+mkdir -p "$T/lists"; printf '../media/songA.wav\r\n\r\n# a comment\r\nhttps://example.com/x.mp3\r\n' > "$T/lists/rel.m3u"
+tunes playlist import "$T/lists/rel.m3u" Rel >/dev/null 2>&1
+rel=$(cat "$T/data/playlists/Rel.tsv")
+assert_contains "relative paths resolve against the m3u folder" "$rel" "$T/lists/../media/songA.wav"
+assert_contains "URLs are kept as-is" "$rel" "https://example.com/x.mp3"
+check "comments, blank lines and CRLF are handled" test "$(grep -c . "$T/data/playlists/Rel.tsv")" -eq 2
+out=$(tunes playlist import "$T/nope.m3u" 2>&1); rc=$?; check "import of a missing file fails" test $rc -ne 0
+out=$(tunes playlist export Nonexistent "$T/x.m3u" 2>&1); rc=$?; check "export of a missing playlist fails" test $rc -ne 0
+
+section "ListenBrainz scrobbling (mock server)"
+mkdir -p "$T/lb"
+cat > "$T/lbsrv.py" <<'EOF'
+import http.server, sys
+d, n = sys.argv[1], [0]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get('Content-Length', 0)))
+        auth = self.headers.get('Authorization', '')
+        if self.path != '/1/submit-listens' or auth == 'Token bad':
+            self.send_response(401); self.end_headers(); self.wfile.write(b'{"code":401}'); return
+        n[0] += 1
+        open('%s/req-%d.json' % (d, n[0]), 'wb').write(body)
+        open('%s/auth-%d.txt' % (d, n[0]), 'w').write(auth)
+        self.send_response(200); self.send_header('Content-Type', 'application/json'); self.end_headers(); self.wfile.write(b'{"status":"ok"}')
+    def log_message(self, *a): pass
+srv = http.server.HTTPServer(('127.0.0.1', 0), H)
+open(d + '/port', 'w').write(str(srv.server_address[1]))
+srv.serve_forever()
+EOF
+python3 "$T/lbsrv.py" "$T/lb" & LLM_PIDS+=($!)
+wait_for test -s "$T/lb/port"; LBPORT=$(cat "$T/lb/port")
+SB="$T/scrob"; mkdir -p "$SB"; b=$(date +%s)
+{
+  printf '%s\tmusic\t200\t210\tSong One\tArtist A - Topic\thttp://x/1\n' $((b - 3000))
+  printf '%s\tmusic\t5\t210\tSkipped\tArtist B\thttp://x/2\n'         $((b - 2900))
+  printf '%s\tpodcast\t3000\t3600\tEpisode\tSome Pod\thttp://x/3\n'  $((b - 2800))
+  printf '%s\tmusic\t200\t210\tNo Artist\t\thttp://x/4\n'             $((b - 2700))
+  printf '%s\tmusic\t100\t200\tSong Two\tArtist C\t/music/two.mp3\n' $((b - 2600))
+  printf '%s\tmusic\t200\t210\tSong Three\tArtist D\thttp://x/6\n'   $((b - 2500))
+} > "$SB/plays.tsv"
+LBENV=(LISTENBRAINZ_URL="http://127.0.0.1:$LBPORT")
+out=$(env "${LBENV[@]}" TUNES_DATA_DIR="$SB" bash "$TUNES" scrobble 2>&1); rc=$?
+check "no token → fails" test $rc -ne 0
+assert_contains "…and tells you where to get one" "$out" "listenbrainz.org/settings"
+out=$(env "${LBENV[@]}" TUNES_DATA_DIR="$SB" bash "$TUNES" scrobble --dry-run 2>&1)
+assert_contains "dry run counts only real music plays" "$out" "3 listens would be submitted"
+check "…and sends nothing" test ! -e "$T/lb/req-1.json"
+out=$(env "${LBENV[@]}" LISTENBRAINZ_TOKEN=tok123 TUNES_DATA_DIR="$SB" bash "$TUNES" scrobble 2>&1)
+assert_contains "scrobble submits the 3 counted plays" "$out" "Submitted 3 listens"
+assert_contains "token is sent in the Authorization header" "$(cat "$T/lb/auth-1.txt" 2>/dev/null)" "Token tok123"
+req="$T/lb/req-1.json"
+check "payload is an import of 3 listens" jq -e '.listen_type == "import" and (.payload | length) == 3' "$req"
+check "'- Topic' suffix is stripped from artists" jq -e '.payload[0].track_metadata.artist_name == "Artist A"' "$req"
+check "track names and timestamps are sent" jq -e '.payload[0].track_metadata.track_name == "Song One" and (.payload[0].listened_at | type) == "number"' "$req"
+check "local files get no origin_url" jq -e '.payload[1].track_metadata.additional_info | has("origin_url") | not' "$req"
+check "client is identified as tunes" jq -e '.payload[0].track_metadata.additional_info.submission_client == "tunes"' "$req"
+out=$(env "${LBENV[@]}" LISTENBRAINZ_TOKEN=tok123 TUNES_DATA_DIR="$SB" bash "$TUNES" scrobble 2>&1)
+assert_contains "second run has nothing new (cursor saved)" "$out" "Nothing new"
+out=$(env "${LBENV[@]}" LISTENBRAINZ_TOKEN=tok123 TUNES_DATA_DIR="$SB" bash "$TUNES" scrobble --all 2>&1)
+assert_contains "--all re-sends the whole history" "$out" "Submitted 3 listens"
+out=$(env "${LBENV[@]}" LISTENBRAINZ_TOKEN=bad TUNES_DATA_DIR="$SB" bash "$TUNES" scrobble --all 2>&1); rc=$?
+check "a rejected token fails" test $rc -ne 0
+assert_contains "…with a helpful message" "$out" "rejected"
+out=$(LISTENBRAINZ_TOKEN=secret123 tunes config show 2>&1)
+assert_not_contains "token is masked in config show" "$out" "secret123"
+out=$(tunes config set LISTENBRAINZ_URL ftp://nope 2>&1); rc=$?; check "LISTENBRAINZ_URL must be http(s)" test $rc -ne 0
+
+section "Backup & restore"
+BK="$T/bk"; mkdir -p "$BK/playlists"
+printf 'x\n' > "$BK/plays.tsv"; printf 'Fav\thttp://f\n' > "$BK/favorites.tsv"; printf 'T\thttp://t\n' > "$BK/playlists/X.tsv"
+mkdir -p "$T/bkout"
+for i in 01 02 03 04 05 06 07 08 09 10 11; do : > "$T/bkout/tunes-backup-2020010100$i.tar.gz"; touch -d "2020-01-$i" "$T/bkout/tunes-backup-2020010100$i.tar.gz"; done
+out=$(tunes_in "$BK" backup "$T/bkout" 2>&1); assert_contains "backup reports the archive" "$out" "Backup saved"
+arc=$(ls -1t "$T/bkout"/tunes-backup-2*.tar.gz | head -n1)
+listing=$(tar -tzf "$arc" 2>&1)
+assert_contains "archive holds the play log" "$listing" "plays.tsv"
+assert_contains "…favourites" "$listing" "favorites.tsv"
+assert_contains "…and playlists" "$listing" "playlists/X.tsv"
+assert_not_contains "…but never settings or API keys" "$listing" "config"
+check "only the newest 10 backups are kept" test "$(ls -1 "$T/bkout"/tunes-backup-*.tar.gz | wc -l)" -eq 10
+rm -f "$BK/plays.tsv" "$BK/playlists/X.tsv"
+out=$(tunes_in "$BK" restore "$arc" -y 2>&1); assert_contains "restore reports success" "$out" "Restored"
+check "play log is back" test -s "$BK/plays.tsv"
+check "playlist is back" test -s "$BK/playlists/X.tsv"
+out=$(echo n | tunes_in "$BK" restore "$arc" 2>&1); assert_contains "restore asks first and honours 'n'" "$out" "Cancelled"
+python3 - "$T/evil.tar.gz" <<'EOF'
+import tarfile, io, sys
+with tarfile.open(sys.argv[1], 'w:gz') as t:
+    i = tarfile.TarInfo('../evil.txt'); i.size = 2; t.addfile(i, io.BytesIO(b'hi'))
+EOF
+out=$(tunes_in "$BK" restore "$T/evil.tar.gz" -y 2>&1); rc=$?
+check "archive with a ../ path is refused" test $rc -ne 0
+check "…and nothing was written outside the data dir" test ! -e "$T/evil.txt"
+out=$(tunes_in "$BK" restore "$T/missing.tar.gz" 2>&1); rc=$?; check "restore of a missing file fails" test $rc -ne 0
+
+section "Self-update (local file:// source)"
+cp "$TUNES" "$T/tunes_copy"
+sed 's/^TUNES_VERSION=.*/TUNES_VERSION="99.0.0"/' "$TUNES" > "$T/tunes_newer"
+sed 's/^TUNES_VERSION=.*/TUNES_VERSION="0.0.1"/' "$TUNES" > "$T/tunes_older"
+echo 'rm -rf /' > "$T/tunes_junk"
+out=$(TUNES_UPDATE_URL="file://$T/tunes_newer" bash "$T/tunes_copy" update --check 2>&1)
+assert_contains "--check sees the newer version" "$out" "99.0.0"
+assert_contains "--check never installs it" "$(bash "$T/tunes_copy" --version)" "tunes 2."
+out=$(TUNES_UPDATE_URL="file://$T/tunes_junk" bash "$T/tunes_copy" update -y 2>&1); rc=$?
+check "a non-tunes file is refused" test $rc -ne 0
+assert_contains "…with a clear reason" "$out" "does not look like a valid tunes script"
+out=$(TUNES_UPDATE_URL="file://$T/tunes_older" bash "$T/tunes_copy" update -y 2>&1)
+assert_contains "an older remote is not installed" "$out" "newer than the published"
+out=$(echo n | TUNES_UPDATE_URL="file://$T/tunes_newer" bash "$T/tunes_copy" update 2>&1)
+assert_contains "update asks first and honours 'n'" "$out" "Cancelled"
+out=$(TUNES_UPDATE_URL="file://$T/tunes_newer" bash "$T/tunes_copy" update -y 2>&1)
+assert_contains "update -y installs" "$out" "Updated to 99.0.0"
+assert_contains "the script is now the new version" "$(bash "$T/tunes_copy" --version)" "99.0.0"
+check "the previous version is kept as .bak" test -f "$T/tunes_copy.bak"
+out=$(TUNES_UPDATE_URL="file://$T/tunes_newer" bash "$T/tunes_copy" update 2>&1)
+assert_contains "running it again says up to date" "$out" "up to date"
+out=$(TUNES_UPDATE_URL="file://$T/does_not_exist" bash "$T/tunes_copy" update 2>&1); rc=$?
+check "an unreachable source fails cleanly" test $rc -ne 0
+
+section "Local library"
+tunes -d local "$T/media" >/dev/null 2>&1
+if wait_for bash -c "bash '$TUNES' status | grep -q Playing"; then ok "local plays the audio files in a folder"; else bad "local plays the audio files in a folder"; fi
+q=$(tunes ctl queue); assert_contains "…as a queue (songA)" "$q" "songA"; assert_contains "…as a queue (songB)" "$q" "songB"
+stop_all
+mkdir -p "$T/emptydir"
+assert_contains "empty folder is graceful" "$(tunes local "$T/emptydir" 2>&1)" "No audio files"
+out=$(tunes local "$T/not-a-folder" 2>&1); rc=$?; check "missing folder fails with a hint" test $rc -ne 0
+assert_contains "…naming MUSIC_DIR" "$out" "MUSIC_DIR"
+
+section "Shareable report card"
+out=$(tunes_in "$SD" report --card week 2>&1)
+assert_contains "card has a headline" "$out" "🎧 My listening"
+assert_contains "…play count" "$out" "5 plays"
+assert_contains "…top track" "$out" "Top track: Recent Hit — Artist R"
+assert_contains "…top artist" "$out" "Top artist: Artist R"
+assert_contains "…and a hashtag" "$out" "#tunes"
+assert_not_contains "card is plain text (no ANSI colours)" "$out" $'\033'
+mkdir -p "$T/emptystats"
+assert_contains "empty period is graceful" "$(tunes_in "$T/emptystats" report --card 2>&1)" "No plays logged"
+
+section "Help & completion list the new commands"
+h=$(tunes help)
+for w in "tunes sleep" "tunes alarm" "tunes scrobble" "tunes forgotten" "tunes backup" "tunes update" "tunes local" "playlist export" "--card" "--save NAME"; do assert_contains "help mentions: $w" "$h" "$w"; done
+c=$(tunes completion)
+for w in sleep alarm scrobble forgotten backup restore update local; do assert_contains "completion offers: $w" "$c" "$w"; done
+assert_contains "config keys include the new settings" "$(tunes config show)" "LISTENBRAINZ_TOKEN"
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [[ $fail -eq 0 ]]
